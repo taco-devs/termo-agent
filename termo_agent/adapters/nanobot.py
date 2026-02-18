@@ -292,14 +292,33 @@ class Adapter(AgentAdapter):
         return {"status": "ok"}
 
     async def update(self) -> dict:
+        """Pull latest Docker image and restart.
+
+        When running in Docker (systemd restarts the container), SIGTERM
+        causes the container to exit; systemd then does ``docker run``
+        again which uses the freshly-pulled image.  Falls back to pip
+        upgrade when not running in Docker.
+        """
         logger.info("Update requested")
         try:
-            result = await asyncio.to_thread(
+            # Try docker pull first (works when running in a container on a Docker host)
+            pull = await asyncio.to_thread(
                 subprocess.run,
-                [sys.executable, "-m", "pip", "install", "--upgrade", "nanobot-ai", "termo-agent"],
+                ["docker", "pull", "registry.digitalocean.com/termo/termo-agent:latest"],
                 capture_output=True, text=True, timeout=120,
             )
-            pip_output = result.stdout.strip() or result.stderr.strip()
+            if pull.returncode == 0:
+                method = "docker"
+                output = pull.stdout.strip()
+            else:
+                # Fallback: pip upgrade (bare-metal / dev installs)
+                pip = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "nanobot-ai", "termo-agent"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                method = "pip"
+                output = "ok" if pip.returncode == 0 else (pip.stdout.strip() or pip.stderr.strip())
 
             # Schedule restart after response is sent
             async def _delayed_restart():
@@ -308,10 +327,7 @@ class Adapter(AgentAdapter):
 
             asyncio.get_event_loop().create_task(_delayed_restart())
 
-            return {
-                "status": "updating",
-                "pip": "ok" if result.returncode == 0 else pip_output,
-            }
+            return {"status": "updating", "method": method, "output": output}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
