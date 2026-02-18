@@ -5,7 +5,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
-# Install nanobot from PyPI
+# Install nanobot from PyPI (vanilla, unmodified)
 RUN pip install --no-cache-dir nanobot-ai
 
 # Install termo-agent from source (not on PyPI yet)

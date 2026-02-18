@@ -1,4 +1,4 @@
-"""NanobotAdapter — connects nanobot-ai to termo-agent."""
+"""NanobotAdapter — connects vanilla nanobot-ai (from PyPI) to termo-agent."""
 
 import asyncio
 import json
@@ -14,13 +14,13 @@ from termo_agent.adapter import AgentAdapter, StreamEvent
 
 logger = logging.getLogger("termo_agent.nanobot")
 
+# Fields in config.json that belong to termo-agent, NOT to nanobot.
+# Stripped before nanobot parses the file so upstream schema doesn't reject them.
+_EXTRA_CONFIG_KEYS = {"api"}
+
 
 class Adapter(AgentAdapter):
-    """Adapter for the nanobot-ai agent framework.
-
-    Replicates the boot sequence from ``nanobot.cli.commands:gateway()`` and
-    maps every endpoint to the corresponding nanobot internal.
-    """
+    """Adapter for the nanobot-ai agent framework (vanilla PyPI version)."""
 
     def __init__(self):
         self.config = None
@@ -30,6 +30,7 @@ class Adapter(AgentAdapter):
         self.session_mgr = None
         self.heartbeat = None
         self.channels = None
+        self._has_stream = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -39,11 +40,12 @@ class Adapter(AgentAdapter):
         from nanobot.config.loader import load_config, get_data_dir
         from nanobot.bus.queue import MessageBus
         from nanobot.agent.loop import AgentLoop
-        from nanobot.channels.manager import ChannelManager
         from nanobot.session.manager import SessionManager
         from nanobot.cron.service import CronService
         from nanobot.cron.types import CronJob
-        from nanobot.heartbeat.service import HeartbeatService
+
+        # Strip non-nanobot fields so vanilla nanobot can load the config
+        _sanitize_config(config_path)
 
         self.config = load_config(config_path)
         self.bus = MessageBus()
@@ -70,6 +72,9 @@ class Adapter(AgentAdapter):
             mcp_servers=self.config.tools.mcp_servers,
         )
 
+        # Detect streaming support
+        self._has_stream = hasattr(self.agent, "process_direct_stream")
+
         # Wire cron callback
         async def _on_cron_job(job: CronJob) -> str | None:
             response = await self.agent.process_direct(
@@ -89,30 +94,42 @@ class Adapter(AgentAdapter):
 
         self.cron.on_job = _on_cron_job
 
-        # Heartbeat
-        async def _on_heartbeat(prompt: str) -> str:
-            return await self.agent.process_direct(prompt, session_key="heartbeat")
+        # Heartbeat (optional — may not exist in all versions)
+        try:
+            from nanobot.heartbeat.service import HeartbeatService
 
-        self.heartbeat = HeartbeatService(
-            workspace=self.config.workspace_path,
-            on_heartbeat=_on_heartbeat,
-            interval_s=30 * 60,
-            enabled=True,
-        )
+            async def _on_heartbeat(prompt: str) -> str:
+                return await self.agent.process_direct(prompt, session_key="heartbeat")
 
-        # Channels
-        self.channels = ChannelManager(self.config, self.bus)
+            self.heartbeat = HeartbeatService(
+                workspace=self.config.workspace_path,
+                on_heartbeat=_on_heartbeat,
+                interval_s=30 * 60,
+                enabled=True,
+            )
+        except ImportError:
+            logger.info("HeartbeatService not available, skipping")
+
+        # Channels (optional)
+        try:
+            from nanobot.channels.manager import ChannelManager
+            self.channels = ChannelManager(self.config, self.bus)
+        except ImportError:
+            logger.info("ChannelManager not available, skipping")
 
         # Start background services
         await self.cron.start()
-        await self.heartbeat.start()
+        if self.heartbeat:
+            await self.heartbeat.start()
         asyncio.create_task(self.agent.run())
-        asyncio.create_task(self.channels.start_all())
+        if self.channels:
+            asyncio.create_task(self.channels.start_all())
 
         logger.info(
-            "Nanobot initialized  model=%s  workspace=%s",
+            "Nanobot initialized  model=%s  workspace=%s  stream=%s",
             self.config.agents.defaults.model,
             self.config.workspace_path,
+            self._has_stream,
         )
 
     async def shutdown(self) -> None:
@@ -142,22 +159,29 @@ class Adapter(AgentAdapter):
     async def send_message_stream(
         self, message: str, session_key: str
     ) -> AsyncIterator[StreamEvent]:
-        async for raw in self.agent.process_direct_stream(
-            content=message,
-            session_key=session_key,
-            channel="api",
-            chat_id=session_key,
-        ):
-            try:
-                data = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            yield StreamEvent(
-                type=data.get("type", "token"),
-                content=data.get("content", ""),
-                name=data.get("name", ""),
-                usage=data.get("usage", {}),
-            )
+        if self._has_stream:
+            # Native streaming support
+            async for raw in self.agent.process_direct_stream(
+                content=message,
+                session_key=session_key,
+                channel="api",
+                chat_id=session_key,
+            ):
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                yield StreamEvent(
+                    type=data.get("type", "token"),
+                    content=data.get("content", ""),
+                    name=data.get("name", ""),
+                    usage=data.get("usage", {}),
+                )
+        else:
+            # Fallback: run sync and emit done event
+            result = await self.send_message(message, session_key)
+            yield StreamEvent(type="token", content=result)
+            yield StreamEvent(type="done", content=result)
 
     # ------------------------------------------------------------------
     # Sessions
@@ -301,7 +325,7 @@ class Adapter(AgentAdapter):
         """
         logger.info("Update requested")
         try:
-            # Try docker pull first (works when running in a container on a Docker host)
+            # Try docker pull first (works when host has Docker)
             pull = await asyncio.to_thread(
                 subprocess.run,
                 ["docker", "pull", "registry.digitalocean.com/termo/termo-agent:latest"],
@@ -337,8 +361,40 @@ class Adapter(AgentAdapter):
 
 
 # ------------------------------------------------------------------
-# Provider factory (ported from nanobot.cli.commands._make_provider)
+# Helpers (outside the class)
 # ------------------------------------------------------------------
+
+def _sanitize_config(config_path: str | None) -> None:
+    """Strip non-nanobot fields from config.json before nanobot loads it.
+
+    termo-agent owns the API layer (port, token, etc.) — those don't belong
+    in the framework config.  If a config contains them, remove them so
+    vanilla nanobot's strict schema doesn't reject the whole file.
+    """
+    from pathlib import Path
+
+    if config_path:
+        p = Path(config_path)
+    else:
+        p = Path.home() / ".nanobot" / "config.json"
+
+    if not p.exists():
+        return
+
+    try:
+        raw = json.loads(p.read_text())
+    except Exception:
+        return
+
+    removed = {k for k in _EXTRA_CONFIG_KEYS if k in raw}
+    if not removed:
+        return
+
+    for k in removed:
+        del raw[k]
+    p.write_text(json.dumps(raw, indent=2))
+    logger.info("Stripped non-nanobot fields from config: %s", removed)
+
 
 def _make_provider(config):
     """Create the appropriate LLM provider from config."""
