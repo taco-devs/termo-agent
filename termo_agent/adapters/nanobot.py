@@ -83,13 +83,8 @@ class Adapter(AgentAdapter):
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
             )
-            if job.payload.deliver and job.payload.to:
-                from nanobot.bus.events import OutboundMessage
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to,
-                    content=response or "",
-                ))
+            if job.payload.deliver and job.payload.to and response:
+                await _deliver_cron_response(job, response)
             return response
 
         self.cron.on_job = _on_cron_job
@@ -487,3 +482,64 @@ def _make_provider(config):
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
     )
+
+
+async def _deliver_cron_response(job, response: str) -> None:
+    """Write a cron job's response directly into Supabase as a message.
+
+    The `to` field is expected to be "user_id:conversation_id".
+    Uses the Supabase REST API with the service role key from the environment.
+    """
+    import aiohttp
+
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not supabase_key:
+        logger.warning("Cron delivery skipped: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set")
+        return
+
+    to = job.payload.to or ""
+    parts = to.split(":", 1)
+    if len(parts) != 2:
+        logger.warning(f"Cron delivery skipped: invalid 'to' format: {to}")
+        return
+
+    conversation_id = parts[1]
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Insert assistant message
+            async with session.post(
+                f"{supabase_url}/rest/v1/messages",
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={
+                    "conversation_id": conversation_id,
+                    "role": "assistant",
+                    "content": response,
+                },
+            ) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    logger.error(f"Cron delivery failed: {resp.status} {body[:200]}")
+                else:
+                    logger.info(f"Cron delivered to conversation {conversation_id}")
+
+            # Update conversation last_at
+            async with session.patch(
+                f"{supabase_url}/rest/v1/conversations?id=eq.{conversation_id}",
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"last_at": "now()"},
+            ) as resp:
+                pass  # Non-fatal
+    except Exception as e:
+        logger.error(f"Cron delivery error: {e}")
