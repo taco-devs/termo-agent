@@ -275,26 +275,50 @@ class Adapter(AgentAdapter):
         jobs = self.cron.list_jobs(include_disabled=True)
         result = []
         for j in jobs:
+            # Flatten schedule to a human-readable string for the frontend
+            sched = j.schedule
+            if sched.kind == "cron" and sched.expr:
+                schedule_str = sched.expr
+            elif sched.kind == "every" and sched.every_ms:
+                mins = sched.every_ms / 60_000
+                schedule_str = f"every {int(mins)}m" if mins == int(mins) else f"every {mins:.1f}m"
+            elif sched.kind == "at" and sched.at_ms:
+                schedule_str = f"once at {sched.at_ms}"
+            else:
+                schedule_str = str(asdict(sched))
+
             result.append({
                 "id": j.id,
                 "name": j.name,
                 "enabled": j.enabled,
-                "schedule": asdict(j.schedule),
-                "payload": asdict(j.payload),
-                "state": asdict(j.state),
+                "schedule": schedule_str,
+                "message": j.payload.message,
+                "deliver": j.payload.deliver,
+                "channel": j.payload.channel,
+                "to": j.payload.to,
+                "last_status": j.state.last_status,
+                "next_run_at_ms": j.state.next_run_at_ms,
             })
         return result
 
     async def add_cron(self, spec: dict) -> dict:
         from nanobot.cron.types import CronSchedule
-        sched_data = spec.get("schedule", {})
-        schedule = CronSchedule(
-            kind=sched_data.get("kind", "every"),
-            at_ms=sched_data.get("at_ms") or sched_data.get("atMs"),
-            every_ms=sched_data.get("every_ms") or sched_data.get("everyMs"),
-            expr=sched_data.get("expr"),
-            tz=sched_data.get("tz"),
-        )
+        sched_raw = spec.get("schedule", {})
+
+        # Frontend sends schedule as a plain string (cron expr or "every Xm")
+        if isinstance(sched_raw, str):
+            sched_raw = sched_raw.strip()
+            schedule = _parse_schedule_string(sched_raw)
+        else:
+            # Structured dict from API clients
+            schedule = CronSchedule(
+                kind=sched_raw.get("kind", "every"),
+                at_ms=sched_raw.get("at_ms") or sched_raw.get("atMs"),
+                every_ms=sched_raw.get("every_ms") or sched_raw.get("everyMs"),
+                expr=sched_raw.get("expr"),
+                tz=sched_raw.get("tz"),
+            )
+
         job = self.cron.add_job(
             name=spec.get("name", "unnamed"),
             schedule=schedule,
@@ -303,7 +327,7 @@ class Adapter(AgentAdapter):
             channel=spec.get("channel"),
             to=spec.get("to"),
         )
-        return {"id": job.id, "name": job.name}
+        return {"id": job.id, "name": job.name, "schedule": sched_raw}
 
     async def delete_cron(self, job_id: str) -> bool:
         return self.cron.remove_job(job_id)
@@ -396,7 +420,39 @@ def _sanitize_config(config_path: str | None) -> None:
     logger.info("Stripped non-nanobot fields from config: %s", removed)
 
 
-def _make_provider(config):
+def _parse_schedule_string(s: str):
+    """Parse a human-friendly schedule string into a CronSchedule.
+
+    Accepts:
+      - Cron expressions: "0 9 * * *", "*/5 * * * *"
+      - Interval shorthand: "every 5m", "every 1h", "every 30s"
+      - Raw milliseconds: "every 60000ms"
+    Falls back to treating the string as a cron expression.
+    """
+    from nanobot.cron.types import CronSchedule
+    import re
+
+    low = s.lower()
+
+    # "every Xm", "every Xh", "every Xs", "every Xms"
+    m = re.match(r"every\s+([\d.]+)\s*(ms|s|m|h)", low)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2)
+        multipliers = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000}
+        every_ms = int(val * multipliers[unit])
+        return CronSchedule(kind="every", every_ms=every_ms)
+
+    # Plain number → treat as minutes
+    if re.match(r"^every\s+\d+$", low):
+        mins = int(low.split()[-1])
+        return CronSchedule(kind="every", every_ms=mins * 60_000)
+
+    # Everything else → cron expression
+    return CronSchedule(kind="cron", expr=s)
+
+
+
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
