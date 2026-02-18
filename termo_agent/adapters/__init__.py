@@ -1,0 +1,1 @@
+"""Adapter registry and discovery."""
