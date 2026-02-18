@@ -452,7 +452,7 @@ def _parse_schedule_string(s: str):
     return CronSchedule(kind="cron", expr=s)
 
 
-
+def _make_provider(config):
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
