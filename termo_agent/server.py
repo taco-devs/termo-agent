@@ -159,6 +159,18 @@ class AgentServer:
         await self.adapter.update_memory(content)
         return web.json_response({"status": "ok"})
 
+    async def _get_heartbeat(self, _request: web.Request) -> web.Response:
+        data = await self.adapter.get_heartbeat()
+        return web.json_response(data)
+
+    async def _patch_heartbeat(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        content = body.get("content")
+        if content is None:
+            return web.json_response({"error": "content is required"}, status=400)
+        await self.adapter.update_heartbeat(content)
+        return web.json_response({"status": "ok"})
+
     async def _update(self, _request: web.Request) -> web.Response:
         result = await self.adapter.update()
         return web.json_response(result)
@@ -185,6 +197,8 @@ class AgentServer:
         app.router.add_delete("/api/crons/{id}", self._delete_cron)
         app.router.add_get("/api/memory", self._get_memory)
         app.router.add_patch("/api/memory", self._patch_memory)
+        app.router.add_get("/api/heartbeat", self._get_heartbeat)
+        app.router.add_patch("/api/heartbeat", self._patch_heartbeat)
         app.router.add_post("/api/update", self._update)
         app.router.add_post("/api/restart", self._restart)
         return app

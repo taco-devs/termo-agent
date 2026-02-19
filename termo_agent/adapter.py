@@ -96,6 +96,16 @@ class AgentAdapter(ABC):
         """Write long-term memory content."""
         pass
 
+    # --- Heartbeat (optional) ---
+
+    async def get_heartbeat(self) -> dict:
+        """Read heartbeat configuration and content."""
+        return {"content": None, "enabled": False, "interval_s": 1800}
+
+    async def update_heartbeat(self, content: str) -> None:
+        """Write heartbeat file content."""
+        pass
+
     # --- Cron (optional) ---
 
     async def list_crons(self) -> list[dict]:

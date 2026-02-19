@@ -293,6 +293,31 @@ class Adapter(AgentAdapter):
         memory.write_long_term(content)
 
     # ------------------------------------------------------------------
+    # Heartbeat
+    # ------------------------------------------------------------------
+
+    async def get_heartbeat(self) -> dict:
+        content = None
+        if self.heartbeat and self.heartbeat.heartbeat_file.exists():
+            try:
+                content = self.heartbeat.heartbeat_file.read_text()
+            except Exception:
+                pass
+        return {
+            "content": content,
+            "enabled": self.heartbeat.enabled if self.heartbeat else False,
+            "interval_s": self.heartbeat.interval_s if self.heartbeat else 1800,
+        }
+
+    async def update_heartbeat(self, content: str) -> None:
+        if self.heartbeat:
+            self.heartbeat.heartbeat_file.write_text(content)
+        else:
+            # Fallback: write to workspace/HEARTBEAT.md directly
+            hb_file = self.config.workspace_path / "HEARTBEAT.md"
+            hb_file.write_text(content)
+
+    # ------------------------------------------------------------------
     # Cron
     # ------------------------------------------------------------------
 
