@@ -75,6 +75,18 @@ class Adapter(AgentAdapter):
         # Detect streaming support
         self._has_stream = hasattr(self.agent, "process_direct_stream")
 
+        # Monkey-patch _tool_hint to show full tool call args (upstream truncates to 40 chars)
+        @staticmethod
+        def _full_tool_hint(tool_calls):
+            def _fmt(tc):
+                val = next(iter(tc.arguments.values()), None) if tc.arguments else None
+                if not isinstance(val, str):
+                    return tc.name
+                return f'{tc.name}("{val}")'
+            return ", ".join(_fmt(tc) for tc in tool_calls)
+
+        AgentLoop._tool_hint = _full_tool_hint
+
         # Wire cron callback
         async def _on_cron_job(job: CronJob) -> str | None:
             response = await self.agent.process_direct(
