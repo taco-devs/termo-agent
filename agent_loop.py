@@ -340,10 +340,91 @@ def search_messages(query: str, limit: int = 10) -> str:
         return f"[error: {e}]"
 
 
+@function_tool
+def create_schedule(schedule: str, message: str, name: str = "") -> str:
+    """Create a recurring scheduled task. The agent will receive the message
+    automatically at the specified times.
+    schedule: cron expression (e.g. "0 9 * * *" for daily at 9am, "*/30 * * * *" for every 30 min)
+    message: the instruction the agent will receive each time the schedule fires
+    name: optional short label for the schedule"""
+    api_url = os.environ.get("TERMO_API_URL", "")
+    agent_id = os.environ.get("TERMO_AGENT_ID", "")
+    if not api_url or not agent_id:
+        return "[error: TERMO_API_URL or TERMO_AGENT_ID not configured]"
+    try:
+        label = name or message[:60]
+        payload = json.dumps({
+            "name": label,
+            "schedule": {"cron": schedule},
+            "payload": {"message": message},
+        }).encode()
+        req = urllib.request.Request(
+            f"{api_url}/agents/{agent_id}/crons",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return f"[schedule created: '{label}' at {schedule}] id={data.get('id', '?')}"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+@function_tool
+def list_schedules() -> str:
+    """List all active scheduled tasks for this agent."""
+    api_url = os.environ.get("TERMO_API_URL", "")
+    agent_id = os.environ.get("TERMO_AGENT_ID", "")
+    if not api_url or not agent_id:
+        return "[error: TERMO_API_URL or TERMO_AGENT_ID not configured]"
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/agents/{agent_id}/crons",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        crons = data.get("crons", [])
+        if not crons:
+            return "[no schedules found]"
+        lines = []
+        for c in crons:
+            sched = c.get("schedule", {})
+            cron_expr = sched.get("cron", str(sched))
+            msg = c.get("payload", {}).get("message", c.get("name", ""))
+            status = "enabled" if c.get("enabled") else "disabled"
+            lines.append(f"- {c['id']}: [{cron_expr}] {msg} ({status}, {c.get('run_count', 0)} runs)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+@function_tool
+def delete_schedule(schedule_id: str) -> str:
+    """Delete a scheduled task by its ID. Use list_schedules to find IDs."""
+    api_url = os.environ.get("TERMO_API_URL", "")
+    agent_id = os.environ.get("TERMO_AGENT_ID", "")
+    if not api_url or not agent_id:
+        return "[error: TERMO_API_URL or TERMO_AGENT_ID not configured]"
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/agents/{agent_id}/crons/{schedule_id}",
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            json.loads(resp.read())
+        return f"[schedule {schedule_id} deleted]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
 TOOLS = [
     execute_command, read_file, write_file, edit_file, list_files,
     web_search, web_fetch, send_message,
     remember, recall, forget, update_memory, search_messages,
+    create_schedule, list_schedules, delete_schedule,
 ]
 
 
@@ -467,6 +548,9 @@ def get_available_tools() -> list[dict]:
         {"name": "forget", "description": "Delete a memory"},
         {"name": "update_memory", "description": "Update an existing memory"},
         {"name": "search_messages", "description": "Search past conversation messages"},
+        {"name": "create_schedule", "description": "Create a recurring scheduled task (cron)"},
+        {"name": "list_schedules", "description": "List all active schedules"},
+        {"name": "delete_schedule", "description": "Delete a scheduled task"},
     ]
 
 
