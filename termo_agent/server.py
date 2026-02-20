@@ -132,21 +132,6 @@ class AgentServer:
         tools = await self.adapter.list_tools()
         return web.json_response(tools)
 
-    async def _list_crons(self, _request: web.Request) -> web.Response:
-        crons = await self.adapter.list_crons()
-        return web.json_response(crons)
-
-    async def _add_cron(self, request: web.Request) -> web.Response:
-        body = await request.json()
-        result = await self.adapter.add_cron(body)
-        return web.json_response(result, status=201)
-
-    async def _delete_cron(self, request: web.Request) -> web.Response:
-        job_id = request.match_info["id"]
-        if await self.adapter.delete_cron(job_id):
-            return web.json_response({"status": "ok"})
-        return web.json_response({"error": "not found"}, status=404)
-
     async def _get_memory(self, _request: web.Request) -> web.Response:
         content = await self.adapter.get_memory()
         return web.json_response({"content": content})
@@ -193,9 +178,6 @@ class AgentServer:
         app.router.add_get("/api/config", self._get_config)
         app.router.add_patch("/api/config", self._patch_config)
         app.router.add_get("/api/tools", self._list_tools)
-        app.router.add_get("/api/crons", self._list_crons)
-        app.router.add_post("/api/crons", self._add_cron)
-        app.router.add_delete("/api/crons/{id}", self._delete_cron)
         app.router.add_get("/api/memory", self._get_memory)
         app.router.add_patch("/api/memory", self._patch_memory)
         app.router.add_get("/api/heartbeat", self._get_heartbeat)

@@ -106,20 +106,6 @@ class AgentAdapter(ABC):
         """Write heartbeat file content."""
         pass
 
-    # --- Cron (optional) ---
-
-    async def list_crons(self) -> list[dict]:
-        """List scheduled jobs."""
-        return []
-
-    async def add_cron(self, spec: dict) -> dict:
-        """Create a scheduled job."""
-        return {}
-
-    async def delete_cron(self, job_id: str) -> bool:
-        """Delete a scheduled job. Return True if deleted."""
-        return False
-
     # --- System (optional) ---
 
     async def health(self) -> dict:

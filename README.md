@@ -10,30 +10,24 @@ Write a small adapter (~50 lines) and any agent framework gets a full REST API f
 pip install termo-agent
 ```
 
-With the built-in nanobot adapter:
-
-```bash
-pip install "termo-agent[nanobot]"
-```
-
 ## Quick start
 
 ```bash
-termo-agent --adapter nanobot --port 3015 --token "my-secret"
+termo-agent --adapter openai_agents --port 8080 --token "my-secret"
 ```
 
 ```bash
 # Health check (always public)
-curl localhost:3015/health
+curl localhost:8080/health
 
 # Send a message (streaming)
-curl -N -X POST localhost:3015/api/sessions/send \
+curl -N -X POST localhost:8080/api/send \
   -H "Authorization: Bearer my-secret" \
   -H "Content-Type: application/json" \
   -d '{"message": "hello", "stream": true}'
 
 # Send a message (sync)
-curl -X POST localhost:3015/api/sessions/send \
+curl -X POST localhost:8080/api/send \
   -H "Authorization: Bearer my-secret" \
   -H "Content-Type: application/json" \
   -d '{"message": "hello"}'
@@ -44,8 +38,8 @@ curl -X POST localhost:3015/api/sessions/send \
 ```
 termo-agent [OPTIONS]
 
---adapter NAME    Adapter to load (default: nanobot)
---port PORT       HTTP port (default: 3015)
+--adapter NAME    Adapter to load (default: openai_agents)
+--port PORT       HTTP port (default: 8080)
 --host ADDR       Bind address (default: 0.0.0.0)
 --token TOKEN     Bearer auth token (default: none, all requests allowed)
 --config PATH     Config file passed to adapter.initialize()
@@ -60,15 +54,12 @@ All options can also be set via environment variables: `TERMO_ADAPTER`, `TERMO_P
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/health` | Health check + version (always public) |
-| POST | `/api/sessions/send` | Send message (sync or SSE stream) |
+| POST | `/api/send` | Send message (sync or SSE stream) |
 | GET | `/api/sessions` | List all sessions |
 | GET | `/api/sessions/{key}/history` | Get conversation history |
 | GET | `/api/config` | Get agent config |
 | PATCH | `/api/config` | Update agent config |
 | GET | `/api/tools` | List registered tools |
-| GET | `/api/crons` | List scheduled jobs |
-| POST | `/api/crons` | Create a scheduled job |
-| DELETE | `/api/crons/{id}` | Delete a scheduled job |
 | GET | `/api/memory` | Get long-term memory |
 | PATCH | `/api/memory` | Update long-term memory |
 | POST | `/api/update` | Pull latest packages + restart |
@@ -76,9 +67,11 @@ All options can also be set via environment variables: `TERMO_ADAPTER`, `TERMO_P
 
 All endpoints except `/health` require a `Authorization: Bearer <token>` header when a token is configured.
 
+Cron scheduling is managed by the API server, not the agent.
+
 ## SSE streaming format
 
-`POST /api/sessions/send` with `{"message": "...", "stream": true}` returns a `text/event-stream`:
+`POST /api/send` with `{"message": "...", "stream": true}` returns a `text/event-stream`:
 
 ```
 data: {"type": "tool_start", "name": "web_search"}
@@ -120,40 +113,12 @@ class Adapter(AgentAdapter):
         return []
 ```
 
-Everything else (config, memory, cron, tools, update, restart) has sensible defaults — override only what your framework supports.
+Everything else (config, memory, tools, update, restart) has sensible defaults — override only what your framework supports.
 
 Save as `termo_agent/adapters/my_framework.py`, then run:
 
 ```bash
 termo-agent --adapter my_framework
-```
-
-### Example: pydantic-ai adapter
-
-```python
-from termo_agent import AgentAdapter, StreamEvent
-
-class Adapter(AgentAdapter):
-    async def initialize(self, config_path=None):
-        from pydantic_ai import Agent
-        self.agent = Agent("openai:gpt-4o")
-        self._history = {}
-
-    async def shutdown(self):
-        pass
-
-    async def send_message(self, message, session_key):
-        result = await self.agent.run(message)
-        return result.output
-
-    async def send_message_stream(self, message, session_key):
-        async with self.agent.run_stream(message) as resp:
-            async for text in resp.stream_text(delta=True):
-                yield StreamEvent(type="token", content=text)
-        yield StreamEvent(type="done", content=resp.output)
-
-    async def get_history(self, session_key):
-        return self._history.get(session_key, [])
 ```
 
 ## Package structure
@@ -166,11 +131,11 @@ termo-agent/
 ├── termo_agent/
 │   ├── __init__.py          # exports AgentAdapter, StreamEvent
 │   ├── adapter.py           # AgentAdapter ABC + StreamEvent dataclass
-│   ├── server.py            # aiohttp HTTP server (14 endpoints)
+│   ├── server.py            # aiohttp HTTP server
 │   ├── cli.py               # CLI entry point
 │   └── adapters/
 │       ├── __init__.py
-│       └── nanobot.py       # Built-in nanobot-ai adapter
+│       └── openai_agents.py # OpenAI Agents SDK + LiteLLM adapter
 ```
 
 ## License

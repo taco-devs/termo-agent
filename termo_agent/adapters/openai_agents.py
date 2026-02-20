@@ -10,7 +10,7 @@ from termo_agent.adapter import AgentAdapter, StreamEvent
 
 logger = logging.getLogger("termo_agent.openai_agents")
 
-AGENT_DIR = Path(os.environ.get("AGENT_DATA_DIR", os.path.expanduser("~/.nanobot")))
+AGENT_DIR = Path(os.environ.get("AGENT_DATA_DIR", os.path.expanduser("~/.termo-agent")))
 SESSIONS_DIR = AGENT_DIR / "sessions"
 MEMORY_DIR = AGENT_DIR / "memory"
 
