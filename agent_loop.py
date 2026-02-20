@@ -78,6 +78,7 @@ async def run_agent_stream(message: str, session_key: str, config: dict, soul_md
         assistant_content = ""
         tokens_in = 0
         tokens_out = 0
+        last_tool_name = "unknown"
 
         async for event in result.stream_events():
             event_type = getattr(event, "type", str(type(event).__name__))
@@ -94,11 +95,20 @@ async def run_agent_stream(message: str, session_key: str, config: dict, soul_md
                 item = event.item
                 item_type = getattr(item, "type", "")
                 if item_type == "tool_call_item":
-                    tool_name = getattr(item, "name", "unknown")
-                    yield {"type": "tool_start", "name": tool_name}
+                    raw = getattr(item, "raw_item", None)
+                    tool_name = getattr(raw, "name", "unknown") if raw else "unknown"
+                    tool_args = getattr(raw, "arguments", "") if raw else ""
+                    last_tool_name = tool_name
+                    tool_input = None
+                    if tool_args:
+                        try:
+                            tool_input = json.loads(tool_args) if isinstance(tool_args, str) else tool_args
+                        except (json.JSONDecodeError, TypeError):
+                            tool_input = {"raw": tool_args}
+                    yield {"type": "tool_start", "name": tool_name, "input": tool_input}
                 elif item_type == "tool_call_output_item":
-                    tool_name = getattr(item, "name", "unknown")
-                    yield {"type": "tool_end", "name": tool_name}
+                    output = getattr(item, "output", "") or ""
+                    yield {"type": "tool_end", "name": last_tool_name, "output": str(output)[:5000]}
 
         # Get final output
         final_output = result.final_output
