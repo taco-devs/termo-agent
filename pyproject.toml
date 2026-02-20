@@ -20,6 +20,9 @@ classifiers = [
 
 dependencies = [
     "aiohttp>=3.9",
+    "openai-agents>=0.1",
+    "litellm>=1.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

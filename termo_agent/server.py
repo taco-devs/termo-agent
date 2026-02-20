@@ -21,7 +21,7 @@ class AgentServer:
         self,
         adapter: AgentAdapter,
         host: str = "0.0.0.0",
-        port: int = 3015,
+        port: int = 8080,
         token: str | None = None,
     ):
         self.adapter = adapter
@@ -186,7 +186,8 @@ class AgentServer:
     def _build_app(self) -> web.Application:
         app = web.Application(middlewares=[self._auth_middleware])
         app.router.add_get("/health", self._health)
-        app.router.add_post("/api/sessions/send", self._send)
+        app.router.add_post("/api/send", self._send)
+        app.router.add_post("/api/sessions/send", self._send)  # backwards compat
         app.router.add_get("/api/sessions/{key}/history", self._history)
         app.router.add_get("/api/sessions", self._list_sessions)
         app.router.add_get("/api/config", self._get_config)

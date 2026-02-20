@@ -1,4 +1,4 @@
-"""CLI entry point: termo-agent --adapter nanobot --port 3015."""
+"""CLI entry point: termo-agent --adapter openai_agents --port 8080."""
 
 import argparse
 import asyncio
@@ -17,14 +17,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adapter",
-        default=os.environ.get("TERMO_ADAPTER", "nanobot"),
-        help="Adapter name (default: nanobot). Looks for termo_agent.adapters.<name>.Adapter",
+        default=os.environ.get("TERMO_ADAPTER", "openai_agents"),
+        help="Adapter name (default: openai_agents). Looks for termo_agent.adapters.<name>.Adapter",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("TERMO_PORT", "3015")),
-        help="HTTP port (default: 3015)",
+        default=int(os.environ.get("TERMO_PORT", "8080")),
+        help="HTTP port (default: 8080)",
     )
     parser.add_argument(
         "--host",
