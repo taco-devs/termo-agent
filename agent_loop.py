@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 from agents import Agent, Runner
-from agents.extensions.models.litellm import LitellmModel
+from agents.extensions.models.litellm_model import LitellmModel
 
 AGENT_DIR = Path(__file__).parent
 SESSIONS_DIR = AGENT_DIR / "sessions"

@@ -43,7 +43,7 @@ class Adapter(AgentAdapter):
 
     def _build_agent(self):
         from agents import Agent
-        from agents.extensions.models.litellm import LitellmModel
+        from agents.extensions.models.litellm_model import LitellmModel
 
         model_name = self.config.get("model", "openrouter/google/gemini-2.0-flash-001")
         api_key = self.config.get("api_key", "")
