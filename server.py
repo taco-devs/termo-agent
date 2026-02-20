@@ -2,7 +2,7 @@
 
 import json
 import os
-import asyncio
+import traceback
 from pathlib import Path
 from aiohttp import web
 from dotenv import load_dotenv
@@ -11,6 +11,18 @@ load_dotenv(Path(__file__).parent / ".env")
 
 AGENT_DIR = Path(__file__).parent
 TERMO_TOKEN = os.environ.get("TERMO_TOKEN", "")
+
+
+@web.middleware
+async def error_middleware(request, handler):
+    """Return JSON tracebacks instead of bare 500 pages."""
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        return web.json_response({"error": str(e), "trace": tb}, status=500)
 
 
 def _check_auth(request):
@@ -68,7 +80,7 @@ async def handle_send(request):
                 data = json.dumps(event)
                 await response.write(f"data: {data}\n\n".encode())
         except Exception as e:
-            err = json.dumps({"type": "error", "content": str(e)})
+            err = json.dumps({"type": "error", "content": str(e), "trace": traceback.format_exc()})
             await response.write(f"data: {err}\n\n".encode())
 
         await response.write_eof()
@@ -107,16 +119,42 @@ async def handle_patch_config(request):
 
 async def handle_get_memory(request):
     _check_auth(request)
-    from memory import load_memory
-    return web.json_response({"content": load_memory()})
+    from memory import get_all_memories
+    return web.json_response({"memories": get_all_memories()})
 
 
 async def handle_patch_memory(request):
     _check_auth(request)
     body = await request.json()
-    from memory import save_memory
-    save_memory(body.get("content", ""))
-    return web.json_response({"status": "ok"})
+    operation = body.get("operation")
+    if operation == "remember":
+        from memory import remember
+        result = remember(body["content"], body.get("category", "fact"), body.get("relationships"))
+    elif operation == "forget":
+        from memory import forget
+        result = forget(body["query"])
+    elif operation == "update":
+        from memory import update_memory_entry
+        result = update_memory_entry(body["query"], body["content"])
+    else:
+        # Legacy: raw content write
+        from memory import save_memory_legacy
+        save_memory_legacy(body.get("content", ""))
+        result = {"status": "ok"}
+    return web.json_response(result)
+
+
+async def handle_search_memory(request):
+    _check_auth(request)
+    body = await request.json()
+    query = body.get("query", "")
+    limit = body.get("limit", 5)
+    category = body.get("category")
+    if not query:
+        return web.json_response({"error": "query is required"}, status=400)
+    from memory import recall
+    results = recall(query, limit=limit, category=category)
+    return web.json_response({"memories": results})
 
 
 async def handle_list_tools(request):
@@ -133,7 +171,7 @@ async def handle_restart(request):
     return web.json_response({"status": "restarted"})
 
 
-app = web.Application()
+app = web.Application(middlewares=[error_middleware])
 app.router.add_get("/health", handle_health)
 app.router.add_post("/api/send", handle_send)
 app.router.add_get("/api/sessions/{key}/history", handle_get_history)
@@ -141,6 +179,7 @@ app.router.add_get("/api/config", handle_get_config)
 app.router.add_patch("/api/config", handle_patch_config)
 app.router.add_get("/api/memory", handle_get_memory)
 app.router.add_patch("/api/memory", handle_patch_memory)
+app.router.add_post("/api/memory/search", handle_search_memory)
 app.router.add_get("/api/tools", handle_list_tools)
 app.router.add_post("/api/restart", handle_restart)
 
