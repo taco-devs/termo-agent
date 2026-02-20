@@ -135,7 +135,7 @@ class Adapter(AgentAdapter):
             if msg.channel == "api" and msg.chat_id:
                 parts = msg.chat_id.split(":", 1)
                 if len(parts) == 2:
-                    await _deliver_to_supabase(parts[1], msg.content)
+                    await _deliver_to_api(parts[1], msg.content)
                 else:
                     logger.warning(f"Outbound API message dropped: bad chat_id format: {msg.chat_id}")
             await _original_publish(msg)
@@ -539,51 +539,39 @@ def _make_provider(config):
     )
 
 
-async def _deliver_to_supabase(conversation_id: str, content: str) -> None:
-    """Write a message directly into Supabase as an assistant message.
+async def _deliver_to_api(conversation_id: str, content: str) -> None:
+    """Deliver a proactive message via the termo API.
 
-    Used by the bus interceptor (for the `message` tool) and cron delivery.
+    Calls POST /agents/deliver on the API server, which writes to the DB
+    on our behalf. This avoids leaking Supabase credentials to agent machines.
     """
     import aiohttp
 
-    supabase_url = os.environ.get("SUPABASE_URL")
-    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    if not supabase_url or not supabase_key:
-        logger.warning("Delivery skipped: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set")
+    api_url = os.environ.get("TERMO_API_URL")
+    token = os.environ.get("TERMO_TOKEN")
+    if not api_url or not token:
+        logger.warning("Delivery skipped: TERMO_API_URL or TERMO_TOKEN not set")
         return
-
-    headers = {
-        "apikey": supabase_key,
-        "Authorization": f"Bearer {supabase_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{supabase_url}/rest/v1/messages",
-                headers=headers,
+                f"{api_url}/agents/deliver",
                 json={
+                    "token": token,
                     "conversation_id": conversation_id,
-                    "role": "assistant",
                     "content": content,
                 },
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status >= 300:
                     body = await resp.text()
-                    logger.error(f"Supabase delivery failed: {resp.status} {body[:200]}")
+                    logger.error(f"API delivery failed: {resp.status} {body[:200]}")
                 else:
                     logger.info(f"Delivered message to conversation {conversation_id}")
-
-            async with session.patch(
-                f"{supabase_url}/rest/v1/conversations?id=eq.{conversation_id}",
-                headers=headers,
-                json={"last_at": "now()"},
-            ) as resp:
-                pass  # Non-fatal
     except Exception as e:
-        logger.error(f"Supabase delivery error: {e}")
+        logger.error(f"API delivery error: {e}")
 
 
 async def _deliver_cron_response(job, response: str) -> None:
@@ -593,4 +581,4 @@ async def _deliver_cron_response(job, response: str) -> None:
     if len(parts) != 2:
         logger.warning(f"Cron delivery skipped: invalid 'to' format: {to}")
         return
-    await _deliver_to_supabase(parts[1], response)
+    await _deliver_to_api(parts[1], response)
