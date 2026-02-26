@@ -8,6 +8,11 @@ import os
 import signal
 import sys
 
+from dotenv import load_dotenv
+
+# Load .env early so env vars (TERMO_TOKEN, etc.) are available for arg defaults
+load_dotenv()
+
 logger = logging.getLogger("termo_agent")
 
 
