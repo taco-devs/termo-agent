@@ -4,17 +4,10 @@ on:
   release:
     types: [published]
 
-permissions:
-  id-token: write  # Required for Trusted Publisher (OIDC)
-
 jobs:
   publish:
     name: Build & Publish
     runs-on: ubuntu-latest
-
-    environment:
-      name: pypi
-      url: https://pypi.org/project/termo-agent/
 
     steps:
       - uses: actions/checkout@v4
@@ -31,4 +24,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # No API token needed — uses Trusted Publisher (OIDC)
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
