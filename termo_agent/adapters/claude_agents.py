@@ -100,7 +100,7 @@ class Adapter(AgentAdapter):
     # --- Core messaging ---
 
     async def send_message(self, message: str, session_key: str) -> str:
-        from claude_agent_sdk import AssistantMessage, TextBlock
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
         messages = self._load_session(session_key)
         messages.append({"role": "user", "content": message})
@@ -111,9 +111,15 @@ class Adapter(AgentAdapter):
         full_text = ""
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
+                if msg.error:
+                    logger.error("AssistantMessage error: %s", msg.error)
+                    continue
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         full_text += block.text
+            elif isinstance(msg, ResultMessage):
+                if msg.result and not full_text:
+                    full_text = msg.result
 
         messages.append({"role": "assistant", "content": full_text})
         self._save_session(session_key, messages)
@@ -124,10 +130,13 @@ class Adapter(AgentAdapter):
     ) -> AsyncIterator[StreamEvent]:
         from claude_agent_sdk import (
             AssistantMessage,
+            ResultMessage,
+            SystemMessage,
             TextBlock,
             ThinkingBlock,
             ToolResultBlock,
             ToolUseBlock,
+            UserMessage,
         )
 
         messages = self._load_session(session_key)
@@ -137,29 +146,104 @@ class Adapter(AgentAdapter):
         await client.query(message)
 
         full_text = ""
-        last_tool_name = ""
+        # Map tool_use_id → tool name so tool_end can reference the right name
+        pending_tools: dict[str, str] = {}
 
         try:
             async for msg in client.receive_response():
+
+                # --- AssistantMessage: text, thinking, tool calls ---
                 if isinstance(msg, AssistantMessage):
+                    if msg.error:
+                        yield StreamEvent(
+                            type="error",
+                            content=str(msg.error),
+                        )
+                        continue
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             full_text += block.text
                             yield StreamEvent(type="token", content=block.text)
                         elif isinstance(block, ToolUseBlock):
-                            last_tool_name = block.name
-                            yield StreamEvent(type="tool_start", name=block.name)
-                        elif isinstance(block, ToolResultBlock):
-                            yield StreamEvent(type="tool_end", name=last_tool_name)
+                            pending_tools[block.id] = block.name
+                            yield StreamEvent(
+                                type="tool_start",
+                                name=block.name,
+                                metadata={"tool_use_id": block.id},
+                            )
                         elif isinstance(block, ThinkingBlock):
                             yield StreamEvent(type="thinking", content=block.thinking)
+
+                # --- UserMessage: tool results (SDK executes tools internally) ---
+                elif isinstance(msg, UserMessage):
+                    content = msg.content
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, ToolResultBlock):
+                                tool_name = pending_tools.pop(block.tool_use_id, "unknown")
+                                yield StreamEvent(
+                                    type="tool_end",
+                                    name=tool_name,
+                                    metadata={
+                                        "tool_use_id": block.tool_use_id,
+                                        "is_error": getattr(block, "is_error", False),
+                                    },
+                                )
+
+                # --- ResultMessage: terminal, carries usage/cost/session ---
+                elif isinstance(msg, ResultMessage):
+                    if getattr(msg, "is_error", False) and not full_text:
+                        result_text = getattr(msg, "result", "") or ""
+                        yield StreamEvent(type="error", content=result_text)
+                        return
+                    # Use result text as fallback if no text blocks were streamed
+                    result_text = getattr(msg, "result", None)
+                    if result_text and not full_text:
+                        full_text = result_text
+                    # Build usage from ResultMessage fields
+                    usage = getattr(msg, "usage", None) or {}
+                    metadata = {}
+                    cost = getattr(msg, "total_cost_usd", None)
+                    if cost is not None:
+                        metadata["cost_usd"] = cost
+                    duration = getattr(msg, "duration_ms", None)
+                    if duration is not None:
+                        metadata["duration_ms"] = duration
+                    num_turns = getattr(msg, "num_turns", None)
+                    if num_turns is not None:
+                        metadata["num_turns"] = num_turns
+                    sid = getattr(msg, "session_id", None)
+                    if sid is not None:
+                        metadata["session_id"] = sid
+                    # receive_response() terminates after ResultMessage,
+                    # so save session and emit done here
+                    messages.append({"role": "assistant", "content": full_text})
+                    self._save_session(session_key, messages)
+                    yield StreamEvent(
+                        type="done",
+                        content=full_text,
+                        usage=usage,
+                        metadata=metadata,
+                    )
+                    return
+
+                # --- SystemMessage: init, progress, etc. ---
+                elif isinstance(msg, SystemMessage):
+                    subtype = getattr(msg, "subtype", "")
+                    data = getattr(msg, "data", {})
+                    yield StreamEvent(
+                        type="progress",
+                        content=subtype,
+                        metadata=data if isinstance(data, dict) else {},
+                    )
+
         except Exception as e:
             yield StreamEvent(type="error", content=str(e))
             return
 
+        # Fallback: if receive_response() ended without a ResultMessage
         messages.append({"role": "assistant", "content": full_text})
         self._save_session(session_key, messages)
-
         yield StreamEvent(type="done", content=full_text, usage={})
 
     async def get_history(self, session_key: str) -> list[dict]:

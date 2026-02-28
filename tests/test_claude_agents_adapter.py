@@ -26,9 +26,10 @@ class FakeToolUseBlock:
 
 
 class FakeToolResultBlock:
-    def __init__(self, tool_use_id="t1", content="ok"):
+    def __init__(self, tool_use_id="t1", content="ok", is_error=False):
         self.tool_use_id = tool_use_id
         self.content = content
+        self.is_error = is_error
 
 
 class FakeThinkingBlock:
@@ -37,8 +38,43 @@ class FakeThinkingBlock:
 
 
 class FakeAssistantMessage:
-    def __init__(self, content):
+    def __init__(self, content, model="claude-opus-4-6", error=None):
         self.content = content
+        self.model = model
+        self.error = error
+        self.parent_tool_use_id = None
+
+
+class FakeUserMessage:
+    def __init__(self, content, parent_tool_use_id=None):
+        self.content = content
+        self.parent_tool_use_id = parent_tool_use_id
+        self.uuid = None
+        self.tool_use_result = None
+
+
+class FakeResultMessage:
+    def __init__(
+        self, result=None, is_error=False, usage=None,
+        total_cost_usd=None, duration_ms=None, num_turns=1,
+        session_id="sess-123", structured_output=None,
+    ):
+        self.subtype = "result"
+        self.result = result
+        self.is_error = is_error
+        self.usage = usage or {}
+        self.total_cost_usd = total_cost_usd
+        self.duration_ms = duration_ms
+        self.duration_api_ms = duration_ms
+        self.num_turns = num_turns
+        self.session_id = session_id
+        self.structured_output = structured_output
+
+
+class FakeSystemMessage:
+    def __init__(self, subtype="init", data=None):
+        self.subtype = subtype
+        self.data = data or {}
 
 
 class FakeClaudeAgentOptions:
@@ -80,6 +116,9 @@ def _build_fake_module():
     mod.ClaudeAgentOptions = FakeClaudeAgentOptions
     mod.ClaudeSDKClient = FakeClient
     mod.AssistantMessage = FakeAssistantMessage
+    mod.UserMessage = FakeUserMessage
+    mod.ResultMessage = FakeResultMessage
+    mod.SystemMessage = FakeSystemMessage
     mod.TextBlock = FakeTextBlock
     mod.ToolUseBlock = FakeToolUseBlock
     mod.ToolResultBlock = FakeToolResultBlock
@@ -187,6 +226,7 @@ class TestSendMessageStream:
 
     @pytest.mark.asyncio
     async def test_stream_with_tools(self, tmp_agent_dir):
+        """Tool use: AssistantMessage has ToolUseBlock, UserMessage has ToolResultBlock."""
         tmp_path, mod = tmp_agent_dir
 
         adapter = mod.Adapter()
@@ -195,10 +235,12 @@ class TestSendMessageStream:
         fake_client = FakeClient(responses=[
             FakeAssistantMessage([
                 FakeTextBlock("Looking up... "),
-                FakeToolUseBlock(name="web_search"),
-                FakeToolResultBlock(),
-                FakeTextBlock("Found it."),
-            ])
+                FakeToolUseBlock(name="web_search", id="t1"),
+            ]),
+            # SDK executes tool internally, result comes as UserMessage
+            FakeUserMessage([FakeToolResultBlock(tool_use_id="t1", content="results")]),
+            FakeAssistantMessage([FakeTextBlock("Found it.")]),
+            FakeResultMessage(result="Looking up... Found it."),
         ])
 
         events = []
@@ -210,6 +252,9 @@ class TestSendMessageStream:
         assert "tool_start" in types
         assert "tool_end" in types
         assert types[-1] == "done"
+        # tool_end should carry the correct tool name
+        tool_end = next(e for e in events if e.type == "tool_end")
+        assert tool_end.name == "web_search"
         assert events[-1].content == "Looking up... Found it."
 
     @pytest.mark.asyncio
@@ -389,3 +434,218 @@ class TestConfigAndMemory:
         adapter = mod.Adapter()
         await adapter.initialize()
         assert await adapter.list_tools() == []
+
+
+class TestResultMessage:
+    @pytest.mark.asyncio
+    async def test_result_message_provides_usage(self, tmp_agent_dir):
+        """ResultMessage carries usage, cost, duration → done event metadata."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage([FakeTextBlock("answer")]),
+            FakeResultMessage(
+                result="answer",
+                usage={"prompt_tokens": 100, "completion_tokens": 50},
+                total_cost_usd=0.005,
+                duration_ms=1200,
+                num_turns=2,
+                session_id="sess-abc",
+            ),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("q", "s1"):
+                events.append(event)
+
+        done = events[-1]
+        assert done.type == "done"
+        assert done.content == "answer"
+        assert done.usage == {"prompt_tokens": 100, "completion_tokens": 50}
+        assert done.metadata["cost_usd"] == 0.005
+        assert done.metadata["duration_ms"] == 1200
+        assert done.metadata["num_turns"] == 2
+        assert done.metadata["session_id"] == "sess-abc"
+
+    @pytest.mark.asyncio
+    async def test_result_message_fallback_text(self, tmp_agent_dir):
+        """If no TextBlocks were streamed, ResultMessage.result is used."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeResultMessage(result="fallback text"),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("q", "s1"):
+                events.append(event)
+
+        done = events[-1]
+        assert done.type == "done"
+        assert done.content == "fallback text"
+
+    @pytest.mark.asyncio
+    async def test_result_message_error(self, tmp_agent_dir):
+        """ResultMessage with is_error=True yields error event."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeResultMessage(is_error=True, result="something went wrong"),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("q", "s1"):
+                events.append(event)
+
+        assert events[0].type == "error"
+        assert "something went wrong" in events[0].content
+
+
+class TestUserMessage:
+    @pytest.mark.asyncio
+    async def test_tool_result_in_user_message(self, tmp_agent_dir):
+        """ToolResultBlock in UserMessage triggers tool_end with correct name."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage([FakeToolUseBlock(name="Read", id="t42")]),
+            FakeUserMessage([FakeToolResultBlock(tool_use_id="t42", content="file contents")]),
+            FakeAssistantMessage([FakeTextBlock("Here's the file.")]),
+            FakeResultMessage(result="Here's the file."),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("read it", "s1"):
+                events.append(event)
+
+        types = [e.type for e in events]
+        assert types == ["tool_start", "tool_end", "token", "done"]
+        assert events[0].name == "Read"
+        assert events[1].name == "Read"
+        assert events[1].metadata["tool_use_id"] == "t42"
+
+    @pytest.mark.asyncio
+    async def test_tool_result_error(self, tmp_agent_dir):
+        """ToolResultBlock with is_error=True is surfaced in metadata."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage([FakeToolUseBlock(name="Bash", id="t1")]),
+            FakeUserMessage([FakeToolResultBlock(tool_use_id="t1", content="exit 1", is_error=True)]),
+            FakeAssistantMessage([FakeTextBlock("Command failed.")]),
+            FakeResultMessage(result="Command failed."),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("run it", "s1"):
+                events.append(event)
+
+        tool_end = next(e for e in events if e.type == "tool_end")
+        assert tool_end.metadata["is_error"] is True
+
+
+class TestSystemMessage:
+    @pytest.mark.asyncio
+    async def test_system_message_yields_progress(self, tmp_agent_dir):
+        """SystemMessage maps to progress event."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeSystemMessage(subtype="init", data={"session_id": "s1"}),
+            FakeAssistantMessage([FakeTextBlock("hi")]),
+            FakeResultMessage(result="hi"),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("hello", "s1"):
+                events.append(event)
+
+        progress = events[0]
+        assert progress.type == "progress"
+        assert progress.content == "init"
+        assert progress.metadata == {"session_id": "s1"}
+
+
+class TestAssistantMessageError:
+    @pytest.mark.asyncio
+    async def test_assistant_error_yields_error_event(self, tmp_agent_dir):
+        """AssistantMessage with error field yields error and skips content."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage(
+                content=[FakeTextBlock("ignored")],
+                error={"type": "overloaded", "message": "API overloaded"},
+            ),
+            FakeAssistantMessage([FakeTextBlock("recovered")]),
+            FakeResultMessage(result="recovered"),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("q", "s1"):
+                events.append(event)
+
+        types = [e.type for e in events]
+        assert types[0] == "error"
+        assert "overloaded" in events[0].content
+        # Should still get the recovered text
+        assert "token" in types
+        done = events[-1]
+        assert done.type == "done"
+        assert done.content == "recovered"
+
+
+class TestMultipleToolCalls:
+    @pytest.mark.asyncio
+    async def test_parallel_tool_calls(self, tmp_agent_dir):
+        """Multiple tool calls in one AssistantMessage, results in separate UserMessages."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage([
+                FakeToolUseBlock(name="Read", id="t1"),
+                FakeToolUseBlock(name="Grep", id="t2"),
+            ]),
+            FakeUserMessage([
+                FakeToolResultBlock(tool_use_id="t1", content="file A"),
+                FakeToolResultBlock(tool_use_id="t2", content="match B"),
+            ]),
+            FakeAssistantMessage([FakeTextBlock("Done.")]),
+            FakeResultMessage(result="Done."),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("find stuff", "s1"):
+                events.append(event)
+
+        types = [e.type for e in events]
+        assert types.count("tool_start") == 2
+        assert types.count("tool_end") == 2
+        # Verify correct tool names on tool_end
+        tool_ends = [e for e in events if e.type == "tool_end"]
+        assert tool_ends[0].name == "Read"
+        assert tool_ends[1].name == "Grep"
