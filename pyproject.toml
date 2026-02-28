@@ -28,6 +28,9 @@ openai = [
     "openai-agents>=0.1",
     "chromadb>=0.4",
 ]
+anthropic = [
+    "claude-agent-sdk>=0.1",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
