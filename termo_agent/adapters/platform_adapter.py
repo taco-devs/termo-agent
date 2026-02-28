@@ -1163,6 +1163,22 @@ class Adapter(AgentAdapter):
                     raw = event.data
                     delta = None
                     reasoning = None
+                    # Debug: log raw event structure to file
+                    try:
+                        _dbg = {"type": getattr(raw, "type", None), "cls": type(raw).__name__}
+                        if hasattr(raw, "delta"):
+                            _dbg["delta_type"] = type(raw.delta).__name__
+                            _dbg["delta_preview"] = str(raw.delta)[:120]
+                        if hasattr(raw, "choices") and raw.choices:
+                            d = getattr(raw.choices[0], "delta", None)
+                            if d:
+                                _dbg["choice_delta_type"] = type(d).__name__
+                                _dbg["choice_delta_keys"] = list(d.__dict__.keys()) if hasattr(d, "__dict__") else (list(d.keys()) if isinstance(d, dict) else "?")
+                                _dbg["has_reasoning"] = bool(getattr(d, "reasoning_content", None) or (d.get("reasoning_content") if isinstance(d, dict) else None))
+                        with open(AGENT_DIR / "raw_events.log", "a") as _f:
+                            _f.write(json.dumps(_dbg) + "\n")
+                    except Exception:
+                        pass
                     # Agents SDK wraps model responses; check type to
                     # distinguish reasoning deltas from text deltas.
                     raw_type = getattr(raw, "type", "") or ""
