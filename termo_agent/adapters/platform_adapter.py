@@ -180,7 +180,7 @@ def _extract_and_save_memories(user_message: str, assistant_response: str, sessi
         api_key = config.get("api_key", "")
 
         payload = json.dumps({
-            "model": "openrouter/google/gemini-2.0-flash-001",
+            "model": "google/gemini-2.5-flash",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 300,
             "temperature": 0.0,

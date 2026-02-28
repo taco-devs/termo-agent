@@ -26,7 +26,7 @@ VALID_CATEGORIES = ("identity", "preference", "fact", "project", "user_profile")
 class TermoEmbeddingFunction(EmbeddingFunction):
     """Calls our LLM proxy for embeddings (text-embedding-3-small via OpenRouter)."""
 
-    def __init__(self, api_base: str, api_key: str, model: str = "openai/text-embedding-3-small"):
+    def __init__(self, api_base: str, api_key: str, model: str = "baai/bge-m3"):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -72,11 +72,25 @@ def _get_collection():
     embed_fn = TermoEmbeddingFunction(api_base=api_base, api_key=api_key)
 
     _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+
+    # If the embedding model changed, the old collection has incompatible dimensions.
+    # Detect this by trying a dummy query; on failure, recreate the collection.
     _collection = _client.get_or_create_collection(
         name="agent_memory",
         embedding_function=embed_fn,
         metadata={"hnsw:space": "cosine"},
     )
+    try:
+        count = _collection.count()
+        if count > 0:
+            _collection.query(query_texts=["dim check"], n_results=1)
+    except Exception:
+        _client.delete_collection("agent_memory")
+        _collection = _client.create_collection(
+            name="agent_memory",
+            embedding_function=embed_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     # Legacy migration
     _migrate_legacy()
