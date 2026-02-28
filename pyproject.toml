@@ -1,6 +1,6 @@
 [project]
 name = "termo-agent"
-version = "0.2.1"
+version = "0.3.0"
 description = "Open-source serverless runtime for AI agents — bring any framework, get a production HTTP server with SSE streaming, sessions, auth, and memory."
 requires-python = ">=3.11"
 license = {text = "MIT"}
