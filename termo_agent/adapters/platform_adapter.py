@@ -865,9 +865,12 @@ class Adapter(AgentAdapter):
 
         model_name = self.config.get("model", "openrouter/google/gemini-2.0-flash-001")
         api_key = self.config.get("api_key", "")
-        api_base = self.config.get("api_base", "https://openrouter.ai/api/v1")
+        api_base = self.config.get("api_base", "")
 
-        # Strip openrouter/ prefix — OpenRouter expects bare model names
+        if not api_base:
+            raise ValueError("api_base is required in config — agent must route through the Termo proxy")
+
+        # Strip openrouter/ prefix — proxy expects bare model names
         if model_name.startswith("openrouter/"):
             model_name = model_name[len("openrouter/"):]
 
