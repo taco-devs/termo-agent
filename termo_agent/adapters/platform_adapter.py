@@ -860,14 +860,19 @@ class Adapter(AgentAdapter):
         self._build_launch_task()
 
     def _get_model(self):
-        from agents.extensions.models.litellm_model import LitellmModel
+        from openai import AsyncOpenAI
+        from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+
         model_name = self.config.get("model", "openrouter/google/gemini-2.0-flash-001")
         api_key = self.config.get("api_key", "")
-        api_base = self.config.get("api_base", "")
-        kwargs = {"model": model_name, "api_key": api_key}
-        if api_base:
-            kwargs["base_url"] = api_base
-        return LitellmModel(**kwargs)
+        api_base = self.config.get("api_base", "https://openrouter.ai/api/v1")
+
+        # Strip openrouter/ prefix — OpenRouter expects bare model names
+        if model_name.startswith("openrouter/"):
+            model_name = model_name[len("openrouter/"):]
+
+        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+        return OpenAIChatCompletionsModel(model=model_name, openai_client=client)
 
     def _build_launch_task(self):
         from agents import Agent, Runner, function_tool
@@ -902,11 +907,15 @@ class Adapter(AgentAdapter):
             if not parent_message_id:
                 return f"[error: subtask register failed: {register_resp}]"
 
+            from agents import ModelSettings as _MS
+            from openai.types.shared import Reasoning as _R
+
             sub_agent = Agent(
                 name="Subtask executor",
                 instructions="You are executing a focused subtask. Complete the following task "
                              "and return a clear, concise summary of results.\n\n" + instructions,
                 model=subtask_model,
+                model_settings=_MS(reasoning=_R(effort="medium")),
                 tools=subtask_tools,
             )
 
@@ -967,8 +976,8 @@ class Adapter(AgentAdapter):
                     elif event_type == "raw_response_event":
                         raw = event.data
                         if hasattr(raw, "usage") and raw.usage:
-                            tokens_in += getattr(raw.usage, "prompt_tokens", 0) or 0
-                            tokens_out += getattr(raw.usage, "completion_tokens", 0) or 0
+                            tokens_in += getattr(raw.usage, "input_tokens", 0) or getattr(raw.usage, "prompt_tokens", 0) or 0
+                            tokens_out += getattr(raw.usage, "output_tokens", 0) or getattr(raw.usage, "completion_tokens", 0) or 0
 
                 final_output = str(result.final_output) if result.final_output else "[subtask completed with no output]"
 
@@ -1096,10 +1105,19 @@ class Adapter(AgentAdapter):
             if bootstrap:
                 instructions += f"\n\n## FIRST RUN — Bootstrap\n{bootstrap}"
 
+        from agents import ModelSettings
+        from openai.types.shared import Reasoning
+
+        reasoning_effort = self.config.get("reasoning_effort", "medium")
+        settings = ModelSettings(
+            reasoning=Reasoning(effort=reasoning_effort),
+        )
+
         return Agent(
             name=self.config.get("persona_name", "Assistant"),
             instructions=instructions,
             model=model,
+            model_settings=settings,
             tools=self._tool_list,
         )
 
@@ -1161,73 +1179,25 @@ class Adapter(AgentAdapter):
 
                 if event_type == "raw_response_event":
                     raw = event.data
-                    delta = None
-                    reasoning = None
-                    # Debug: log raw event structure to file
-                    try:
-                        _dbg = {"type": getattr(raw, "type", None), "cls": type(raw).__name__}
-                        if hasattr(raw, "delta"):
-                            _dbg["delta_type"] = type(raw.delta).__name__
-                            _dbg["delta_preview"] = str(raw.delta)[:120]
-                        if hasattr(raw, "choices") and raw.choices:
-                            d = getattr(raw.choices[0], "delta", None)
-                            if d:
-                                _dbg["choice_delta_type"] = type(d).__name__
-                                _dbg["choice_delta_keys"] = list(d.__dict__.keys()) if hasattr(d, "__dict__") else (list(d.keys()) if isinstance(d, dict) else "?")
-                                _dbg["has_reasoning"] = bool(getattr(d, "reasoning_content", None) or (d.get("reasoning_content") if isinstance(d, dict) else None))
-                        with open(AGENT_DIR / "raw_events.log", "a") as _f:
-                            _f.write(json.dumps(_dbg) + "\n")
-                    except Exception:
-                        pass
-                    # Agents SDK wraps model responses; check type to
-                    # distinguish reasoning deltas from text deltas.
                     raw_type = getattr(raw, "type", "") or ""
-                    raw_cls = type(raw).__name__.lower()
-                    is_reasoning_event = (
-                        "reasoning" in raw_type or "reasoning" in raw_cls
-                        or "thinking" in raw_type or "thinking" in raw_cls
-                    )
-                    # Skip function call argument deltas — they are NOT text content
-                    is_func_args = (
-                        "function_call_arguments" in raw_type
-                        or "function_call" in raw_type
-                    )
-                    if is_reasoning_event and hasattr(raw, "delta") and isinstance(raw.delta, str):
-                        reasoning = raw.delta
-                    elif is_func_args:
-                        pass  # tool call JSON chunks, not display text
-                    elif hasattr(raw, "delta") and isinstance(raw.delta, str):
+
+                    # Reasoning / thinking tokens
+                    if "reasoning" in raw_type and hasattr(raw, "delta") and isinstance(raw.delta, str):
+                        yield StreamEvent(type="thinking", content=raw.delta)
+                    # Text content tokens
+                    elif raw_type == "response.output_text.delta" and hasattr(raw, "delta") and isinstance(raw.delta, str):
                         delta = raw.delta
-                    elif hasattr(raw, "choices") and raw.choices:
-                        d = getattr(raw.choices[0], "delta", None)
-                        if d:
-                            # LiteLLM/OpenRouter: check for tool_calls — if
-                            # present the chunk is a function call, not text.
-                            has_tool_calls = False
-                            if isinstance(d, dict):
-                                has_tool_calls = bool(d.get("tool_calls"))
-                            else:
-                                tc = getattr(d, "tool_calls", None)
-                                has_tool_calls = bool(tc)
-                            if not has_tool_calls:
-                                delta = getattr(d, "content", None) if not isinstance(d, dict) else d.get("content")
-                            reasoning = getattr(d, "reasoning_content", None) or (
-                                d.get("reasoning_content") if isinstance(d, dict) else None
-                            )
-                    # Also check usage on every raw event
-                    if hasattr(raw, "usage") and raw.usage:
-                        tokens_in += getattr(raw.usage, "prompt_tokens", 0) or 0
-                        tokens_out += getattr(raw.usage, "completion_tokens", 0) or 0
-                    # Emit reasoning/thinking tokens separately
-                    if reasoning:
-                        yield StreamEvent(type="thinking", content=reasoning)
-                    if delta and delta == prev_delta:
-                        prev_delta = None
-                        continue
-                    if delta:
-                        prev_delta = delta
-                        streamed_content += delta
-                        yield StreamEvent(type="token", content=delta)
+                        if delta and delta == prev_delta:
+                            prev_delta = None
+                            continue
+                        if delta:
+                            prev_delta = delta
+                            streamed_content += delta
+                            yield StreamEvent(type="token", content=delta)
+                    # Usage info
+                    elif hasattr(raw, "usage") and raw.usage:
+                        tokens_in += getattr(raw.usage, "input_tokens", 0) or getattr(raw.usage, "prompt_tokens", 0) or 0
+                        tokens_out += getattr(raw.usage, "output_tokens", 0) or getattr(raw.usage, "completion_tokens", 0) or 0
 
                 elif event_type == "run_item_stream_event":
                     item = event.item
@@ -1270,8 +1240,8 @@ class Adapter(AgentAdapter):
                 for resp in result.raw_responses:
                     usage = getattr(resp, "usage", None)
                     if usage:
-                        tokens_in += getattr(usage, "prompt_tokens", 0) or 0
-                        tokens_out += getattr(usage, "completion_tokens", 0) or 0
+                        tokens_in += getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0
+                        tokens_out += getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0
 
             messages.append({"role": "assistant", "content": assistant_content})
             _save_session(session_key, messages)

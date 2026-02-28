@@ -1,6 +1,6 @@
 [project]
 name = "termo-agent"
-version = "0.1.7"
+version = "0.2.0"
 description = "Open-source serverless runtime for AI agents — bring any framework, get a production HTTP server with SSE streaming, sessions, auth, and memory."
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -26,7 +26,6 @@ dependencies = [
 [project.optional-dependencies]
 openai = [
     "openai-agents>=0.1",
-    "litellm>=1.0",
     "chromadb>=0.4",
 ]
 dev = [
