@@ -1299,11 +1299,11 @@ class Adapter(AgentAdapter):
 
     # --- Memory ---
 
-    async def get_memory(self) -> str | None:
+    async def get_memory(self) -> dict | None:
         try:
             from termo_agent.adapters.memory_engine import get_all_memories
             memories = get_all_memories()
-            return json.dumps({"memories": memories})
+            return {"memories": memories}
         except Exception:
             return None
 

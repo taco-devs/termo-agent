@@ -88,7 +88,7 @@ class AgentAdapter(ABC):
 
     # --- Memory (optional) ---
 
-    async def get_memory(self) -> str | None:
+    async def get_memory(self) -> str | dict | None:
         """Read long-term memory content."""
         return None
 

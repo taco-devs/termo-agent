@@ -137,6 +137,8 @@ class AgentServer:
 
     async def _get_memory(self, _request: web.Request) -> web.Response:
         content = await self.adapter.get_memory()
+        if isinstance(content, dict):
+            return web.json_response(content)
         return web.json_response({"content": content})
 
     async def _patch_memory(self, request: web.Request) -> web.Response:
