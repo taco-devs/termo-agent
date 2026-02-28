@@ -1,5 +1,6 @@
 """Claude Agent SDK adapter — connects Claude Agent SDK to termo-agent."""
 
+import importlib.util
 import json
 import logging
 import os
@@ -13,6 +14,26 @@ logger = logging.getLogger("termo_agent.claude_agents")
 AGENT_DIR = Path(os.environ.get("AGENT_DATA_DIR", os.path.expanduser("~/.termo-agent")))
 SESSIONS_DIR = AGENT_DIR / "sessions"
 MEMORY_DIR = AGENT_DIR / "memory"
+
+# Supported hook events — snake_case function name → PascalCase SDK event
+HOOK_EVENTS = {
+    "pre_tool_use": "PreToolUse",
+    "post_tool_use": "PostToolUse",
+    "post_tool_use_failure": "PostToolUseFailure",
+    "notification": "Notification",
+    "user_prompt_submit": "UserPromptSubmit",
+    "session_start": "SessionStart",
+    "session_end": "SessionEnd",
+    "stop": "Stop",
+    "subagent_start": "SubagentStart",
+    "subagent_stop": "SubagentStop",
+    "pre_compact": "PreCompact",
+    "permission_request": "PermissionRequest",
+    "setup": "Setup",
+    "teammate_idle": "TeammateIdle",
+    "task_completed": "TaskCompleted",
+    "config_change": "ConfigChange",
+}
 
 
 class Adapter(AgentAdapter):
@@ -51,6 +72,35 @@ class Adapter(AgentAdapter):
         self._build_options()
         logger.info("Claude Agents adapter initialized")
 
+    def _load_hooks(self) -> dict:
+        """Load hook functions from AGENT_DIR/hooks.py."""
+        hooks_file = AGENT_DIR / "hooks.py"
+        if not hooks_file.exists():
+            return {}
+
+        from claude_agent_sdk import HookMatcher
+
+        try:
+            spec = importlib.util.spec_from_file_location("termo_hooks", hooks_file)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            logger.error("Failed to load hooks.py: %s", e)
+            return {}
+
+        hook_config = self.config.get("hooks", {})
+        hooks: dict[str, list] = {}
+
+        for fn_name, event_name in HOOK_EVENTS.items():
+            fn = getattr(mod, fn_name, None)
+            if fn is None or not callable(fn):
+                continue
+            matcher = hook_config.get(event_name, {}).get("matcher", ".*")
+            hooks[event_name] = [HookMatcher(matcher=matcher, hooks=[fn])]
+            logger.info("Loaded hook %s (matcher=%s)", event_name, matcher)
+
+        return hooks
+
     def _build_options(self, resume: str | None = None):
         from claude_agent_sdk import ClaudeAgentOptions
 
@@ -66,10 +116,15 @@ class Adapter(AgentAdapter):
         for key in (
             "max_turns", "max_budget_usd", "thinking", "mcp_servers",
             "agents", "betas", "output_format", "setting_sources", "env",
+            "tools", "disallowed_tools", "allow_dangerously_skip_permissions",
         ):
             val = self.config.get(key)
             if val is not None:
                 kwargs[key] = val
+
+        hooks = self._load_hooks()
+        if hooks:
+            kwargs["hooks"] = hooks
 
         if resume:
             kwargs["resume"] = resume

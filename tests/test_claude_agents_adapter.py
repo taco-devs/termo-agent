@@ -112,6 +112,12 @@ class FakeClient:
 # Build a fake claude_agent_sdk module and inject it into sys.modules
 # ---------------------------------------------------------------------------
 
+class FakeHookMatcher:
+    def __init__(self, matcher=".*", hooks=None):
+        self.matcher = matcher
+        self.hooks = hooks or []
+
+
 def _build_fake_module():
     mod = ModuleType("claude_agent_sdk")
     mod.ClaudeAgentOptions = FakeClaudeAgentOptions
@@ -124,6 +130,7 @@ def _build_fake_module():
     mod.ToolUseBlock = FakeToolUseBlock
     mod.ToolResultBlock = FakeToolResultBlock
     mod.ThinkingBlock = FakeThinkingBlock
+    mod.HookMatcher = FakeHookMatcher
     return mod
 
 
@@ -816,6 +823,27 @@ class TestConfigPassthrough:
         assert opts.allowed_tools == ["Read", "Grep"]
 
     @pytest.mark.asyncio
+    async def test_tools_and_disallowed_forwarded(self, tmp_agent_dir):
+        """tools, disallowed_tools, allow_dangerously_skip_permissions forwarded."""
+        tmp_path, mod = tmp_agent_dir
+        config = {
+            "tools": ["Read", "Glob"],
+            "disallowed_tools": ["Bash"],
+            "allow_dangerously_skip_permissions": True,
+            "permission_mode": "bypassPermissions",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        opts = adapter._options
+        assert opts.tools == ["Read", "Glob"]
+        assert opts.disallowed_tools == ["Bash"]
+        assert opts.allow_dangerously_skip_permissions is True
+        assert opts.permission_mode == "bypassPermissions"
+
+    @pytest.mark.asyncio
     async def test_unset_options_not_forwarded(self, tmp_agent_dir):
         """Options not in config don't appear on ClaudeAgentOptions."""
         _, mod = tmp_agent_dir
@@ -826,3 +854,95 @@ class TestConfigPassthrough:
         assert not hasattr(opts, "max_turns")
         assert not hasattr(opts, "max_budget_usd")
         assert not hasattr(opts, "thinking")
+
+
+class TestHooks:
+    @pytest.mark.asyncio
+    async def test_no_hooks_file(self, tmp_agent_dir):
+        """No hooks.py → _load_hooks() returns empty dict."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        assert adapter._load_hooks() == {}
+        assert not hasattr(adapter._options, "hooks")
+
+    @pytest.mark.asyncio
+    async def test_hooks_loaded_from_file(self, tmp_agent_dir):
+        """hooks.py with async def post_tool_use → discovered and wrapped."""
+        tmp_path, mod = tmp_agent_dir
+        (tmp_path / "hooks.py").write_text(
+            "async def post_tool_use(input_data, tool_use_id, context):\n"
+            "    return {}\n"
+        )
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        hooks = adapter._load_hooks()
+        assert "PostToolUse" in hooks
+        assert len(hooks["PostToolUse"]) == 1
+        hm = hooks["PostToolUse"][0]
+        assert hm.matcher == ".*"
+        assert len(hm.hooks) == 1
+        assert callable(hm.hooks[0])
+
+    @pytest.mark.asyncio
+    async def test_hooks_with_matcher_from_config(self, tmp_agent_dir):
+        """Config hooks.PreToolUse.matcher = 'Bash' → forwarded to HookMatcher."""
+        tmp_path, mod = tmp_agent_dir
+        (tmp_path / "hooks.py").write_text(
+            "async def pre_tool_use(input_data, tool_use_id, context):\n"
+            "    return {}\n"
+        )
+        config = {"hooks": {"PreToolUse": {"matcher": "Bash"}}}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        hooks = adapter._load_hooks()
+        assert hooks["PreToolUse"][0].matcher == "Bash"
+
+    @pytest.mark.asyncio
+    async def test_hooks_default_matcher(self, tmp_agent_dir):
+        """No config matcher → defaults to '.*'."""
+        tmp_path, mod = tmp_agent_dir
+        (tmp_path / "hooks.py").write_text(
+            "async def notification(data, context):\n"
+            "    return {}\n"
+        )
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        hooks = adapter._load_hooks()
+        assert hooks["Notification"][0].matcher == ".*"
+
+    @pytest.mark.asyncio
+    async def test_hooks_passed_to_options(self, tmp_agent_dir):
+        """_options.hooks contains the loaded hooks after initialize."""
+        tmp_path, mod = tmp_agent_dir
+        (tmp_path / "hooks.py").write_text(
+            "async def post_tool_use(input_data, tool_use_id, context):\n"
+            "    return {}\n"
+        )
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        assert hasattr(adapter._options, "hooks")
+        assert "PostToolUse" in adapter._options.hooks
+
+    @pytest.mark.asyncio
+    async def test_invalid_hooks_file(self, tmp_agent_dir):
+        """hooks.py with syntax error → logs error, returns empty dict."""
+        tmp_path, mod = tmp_agent_dir
+        (tmp_path / "hooks.py").write_text("def broken(\n")
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        hooks = adapter._load_hooks()
+        assert hooks == {}
+        assert not hasattr(adapter._options, "hooks")
