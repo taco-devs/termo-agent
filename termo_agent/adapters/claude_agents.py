@@ -23,6 +23,7 @@ class Adapter(AgentAdapter):
         self.soul_md: str = "You are a helpful assistant."
         self._sessions: dict[str, list] = {}
         self._clients: dict[str, Any] = {}
+        self._session_ids: dict[str, str] = {}  # session_key → SDK session_id
         self._options: Any = None
 
     async def initialize(self, config_path: str | None = None) -> None:
@@ -39,32 +40,66 @@ class Adapter(AgentAdapter):
         if soul_file.exists():
             self.soul_md = soul_file.read_text()
 
+        # Load persisted SDK session IDs for resumption after restart
+        sid_file = SESSIONS_DIR / "_sdk_session_ids.json"
+        if sid_file.exists():
+            try:
+                self._session_ids = json.loads(sid_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                self._session_ids = {}
+
         self._build_options()
         logger.info("Claude Agents adapter initialized")
 
-    def _build_options(self):
+    def _build_options(self, resume: str | None = None):
         from claude_agent_sdk import ClaudeAgentOptions
 
-        self._options = ClaudeAgentOptions(
-            system_prompt=self.soul_md,
-            model=self.config.get("model"),
-            allowed_tools=self.config.get("allowed_tools", []),
-            permission_mode=self.config.get("permission_mode", "acceptEdits"),
-            cwd=str(self.config.get("cwd", AGENT_DIR)),
-        )
+        kwargs: dict[str, Any] = {
+            "system_prompt": self.soul_md,
+            "model": self.config.get("model"),
+            "allowed_tools": self.config.get("allowed_tools", []),
+            "permission_mode": self.config.get("permission_mode", "acceptEdits"),
+            "cwd": str(self.config.get("cwd", AGENT_DIR)),
+        }
+
+        # Forward Claude-specific options from config
+        for key in (
+            "max_turns", "max_budget_usd", "thinking", "mcp_servers",
+            "agents", "betas", "output_format", "setting_sources", "env",
+        ):
+            val = self.config.get(key)
+            if val is not None:
+                kwargs[key] = val
+
+        if resume:
+            kwargs["resume"] = resume
+
+        self._options = ClaudeAgentOptions(**kwargs)
 
     async def _get_client(self, session_key: str) -> Any:
         if session_key not in self._clients:
             from claude_agent_sdk import ClaudeSDKClient
+
+            # Resume SDK session if we have a stored session_id
+            sdk_session_id = self._session_ids.get(session_key)
+            if sdk_session_id:
+                self._build_options(resume=sdk_session_id)
+            else:
+                self._build_options()
 
             client = ClaudeSDKClient(options=self._options)
             await client.connect()
             self._clients[session_key] = client
         return self._clients[session_key]
 
+    def _save_session_ids(self):
+        sid_file = SESSIONS_DIR / "_sdk_session_ids.json"
+        sid_file.write_text(json.dumps(self._session_ids))
+
     async def shutdown(self) -> None:
         for key, messages in self._sessions.items():
             self._save_session_disk(key, messages)
+        self._save_session_ids()
         for client in self._clients.values():
             try:
                 await client.__aexit__(None, None, None)
@@ -96,6 +131,8 @@ class Adapter(AgentAdapter):
     def _save_session(self, key: str, messages: list):
         self._sessions[key] = messages
         self._save_session_disk(key, messages)
+        if key in self._session_ids:
+            self._save_session_ids()
 
     # --- Core messaging ---
 
@@ -166,10 +203,14 @@ class Adapter(AgentAdapter):
                             yield StreamEvent(type="token", content=block.text)
                         elif isinstance(block, ToolUseBlock):
                             pending_tools[block.id] = block.name
+                            meta: dict[str, Any] = {"tool_use_id": block.id}
+                            tool_input = getattr(block, "input", None)
+                            if tool_input:
+                                meta["input"] = tool_input
                             yield StreamEvent(
                                 type="tool_start",
                                 name=block.name,
-                                metadata={"tool_use_id": block.id},
+                                metadata=meta,
                             )
                         elif isinstance(block, ThinkingBlock):
                             yield StreamEvent(type="thinking", content=block.thinking)
@@ -181,13 +222,21 @@ class Adapter(AgentAdapter):
                         for block in content:
                             if isinstance(block, ToolResultBlock):
                                 tool_name = pending_tools.pop(block.tool_use_id, "unknown")
+                                end_meta: dict[str, Any] = {
+                                    "tool_use_id": block.tool_use_id,
+                                    "is_error": getattr(block, "is_error", False),
+                                }
+                                result_content = getattr(block, "content", None)
+                                if result_content is not None:
+                                    end_meta["output"] = (
+                                        result_content
+                                        if isinstance(result_content, str)
+                                        else str(result_content)
+                                    )
                                 yield StreamEvent(
                                     type="tool_end",
                                     name=tool_name,
-                                    metadata={
-                                        "tool_use_id": block.tool_use_id,
-                                        "is_error": getattr(block, "is_error", False),
-                                    },
+                                    metadata=end_meta,
                                 )
 
                 # --- ResultMessage: terminal, carries usage/cost/session ---
@@ -231,6 +280,11 @@ class Adapter(AgentAdapter):
                 elif isinstance(msg, SystemMessage):
                     subtype = getattr(msg, "subtype", "")
                     data = getattr(msg, "data", {})
+                    # Capture SDK session_id for future resumption
+                    if subtype == "init":
+                        sid = getattr(msg, "session_id", None)
+                        if sid:
+                            self._session_ids[session_key] = sid
                     yield StreamEvent(
                         type="progress",
                         content=subtype,
@@ -282,7 +336,8 @@ class Adapter(AgentAdapter):
     # --- Tools ---
 
     async def list_tools(self) -> list[dict]:
-        return []
+        allowed = self.config.get("allowed_tools", [])
+        return [{"name": t, "type": "builtin"} for t in allowed]
 
     # --- System ---
 
@@ -291,6 +346,7 @@ class Adapter(AgentAdapter):
 
     async def restart(self) -> None:
         self._sessions.clear()
+        self._session_ids.clear()
         for client in self._clients.values():
             try:
                 await client.__aexit__(None, None, None)

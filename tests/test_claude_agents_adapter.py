@@ -72,9 +72,10 @@ class FakeResultMessage:
 
 
 class FakeSystemMessage:
-    def __init__(self, subtype="init", data=None):
+    def __init__(self, subtype="init", data=None, session_id=None):
         self.subtype = subtype
         self.data = data or {}
+        self.session_id = session_id
 
 
 class FakeClaudeAgentOptions:
@@ -435,6 +436,20 @@ class TestConfigAndMemory:
         await adapter.initialize()
         assert await adapter.list_tools() == []
 
+    @pytest.mark.asyncio
+    async def test_list_tools_from_config(self, tmp_agent_dir):
+        tmp_path, mod = tmp_agent_dir
+        config = {"allowed_tools": ["Read", "Edit", "Bash"]}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        tools = await adapter.list_tools()
+        assert len(tools) == 3
+        assert tools[0] == {"name": "Read", "type": "builtin"}
+        assert tools[2] == {"name": "Bash", "type": "builtin"}
+
 
 class TestResultMessage:
     @pytest.mark.asyncio
@@ -649,3 +664,165 @@ class TestMultipleToolCalls:
         tool_ends = [e for e in events if e.type == "tool_end"]
         assert tool_ends[0].name == "Read"
         assert tool_ends[1].name == "Grep"
+
+
+class TestSessionResumption:
+    @pytest.mark.asyncio
+    async def test_session_id_captured_from_init(self, tmp_agent_dir):
+        """SystemMessage(subtype='init') captures session_id for resumption."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeSystemMessage(subtype="init", session_id="sdk-sess-abc"),
+            FakeAssistantMessage([FakeTextBlock("hi")]),
+            FakeResultMessage(result="hi"),
+        ])
+
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for _ in adapter.send_message_stream("hello", "s1"):
+                pass
+
+        assert adapter._session_ids.get("s1") == "sdk-sess-abc"
+
+    @pytest.mark.asyncio
+    async def test_session_id_persisted_to_disk(self, tmp_agent_dir):
+        """Session IDs survive restart via disk persistence."""
+        tmp_path, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        # Simulate a captured session ID
+        adapter._session_ids["s1"] = "sdk-sess-xyz"
+        adapter._save_session_ids()
+
+        sid_file = tmp_path / "sessions" / "_sdk_session_ids.json"
+        assert sid_file.exists()
+        assert json.loads(sid_file.read_text())["s1"] == "sdk-sess-xyz"
+
+        # New adapter should load it
+        adapter2 = mod.Adapter()
+        await adapter2.initialize()
+        assert adapter2._session_ids.get("s1") == "sdk-sess-xyz"
+
+    @pytest.mark.asyncio
+    async def test_resume_used_on_reconnect(self, tmp_agent_dir):
+        """When a stored session_id exists, _get_client rebuilds options with resume."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+        adapter._session_ids["s1"] = "sdk-sess-resume"
+
+        # _get_client should call _build_options(resume=...) then create client
+        built_options = []
+        orig_build = adapter._build_options
+
+        def spy_build(resume=None):
+            built_options.append(resume)
+            orig_build(resume=resume)
+
+        with patch.object(adapter, "_build_options", side_effect=spy_build):
+            await adapter._get_client("s1")
+
+        assert built_options == ["sdk-sess-resume"]
+
+    @pytest.mark.asyncio
+    async def test_restart_clears_session_ids(self, tmp_agent_dir):
+        """restart() clears session IDs."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+        adapter._session_ids["s1"] = "old-id"
+
+        await adapter.restart()
+
+        assert adapter._session_ids == {}
+
+
+class TestToolInputOutput:
+    @pytest.mark.asyncio
+    async def test_tool_start_includes_input(self, tmp_agent_dir):
+        """tool_start metadata includes the tool input."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage([
+                FakeToolUseBlock(name="Read", id="t1", input={"file_path": "/foo.py"}),
+            ]),
+            FakeUserMessage([FakeToolResultBlock(tool_use_id="t1", content="contents")]),
+            FakeAssistantMessage([FakeTextBlock("Done.")]),
+            FakeResultMessage(result="Done."),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("read", "s1"):
+                events.append(event)
+
+        tool_start = next(e for e in events if e.type == "tool_start")
+        assert tool_start.metadata["input"] == {"file_path": "/foo.py"}
+
+    @pytest.mark.asyncio
+    async def test_tool_end_includes_output(self, tmp_agent_dir):
+        """tool_end metadata includes the tool result content."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        fake_client = FakeClient(responses=[
+            FakeAssistantMessage([FakeToolUseBlock(name="Bash", id="t1")]),
+            FakeUserMessage([FakeToolResultBlock(
+                tool_use_id="t1", content="total 42\ndrwxr-xr-x ..."
+            )]),
+            FakeAssistantMessage([FakeTextBlock("Listed.")]),
+            FakeResultMessage(result="Listed."),
+        ])
+
+        events = []
+        with patch.object(adapter, "_get_client", return_value=fake_client):
+            async for event in adapter.send_message_stream("ls", "s1"):
+                events.append(event)
+
+        tool_end = next(e for e in events if e.type == "tool_end")
+        assert "total 42" in tool_end.metadata["output"]
+
+
+class TestConfigPassthrough:
+    @pytest.mark.asyncio
+    async def test_claude_options_forwarded(self, tmp_agent_dir):
+        """Claude-specific config keys are forwarded to ClaudeAgentOptions."""
+        tmp_path, mod = tmp_agent_dir
+        config = {
+            "model": "claude-opus-4-6",
+            "max_turns": 10,
+            "max_budget_usd": 0.50,
+            "thinking": {"type": "adaptive"},
+            "betas": ["context-1m-2025-08-07"],
+            "allowed_tools": ["Read", "Grep"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        opts = adapter._options
+        assert opts.max_turns == 10
+        assert opts.max_budget_usd == 0.50
+        assert opts.thinking == {"type": "adaptive"}
+        assert opts.betas == ["context-1m-2025-08-07"]
+        assert opts.allowed_tools == ["Read", "Grep"]
+
+    @pytest.mark.asyncio
+    async def test_unset_options_not_forwarded(self, tmp_agent_dir):
+        """Options not in config don't appear on ClaudeAgentOptions."""
+        _, mod = tmp_agent_dir
+        adapter = mod.Adapter()
+        await adapter.initialize()
+
+        opts = adapter._options
+        assert not hasattr(opts, "max_turns")
+        assert not hasattr(opts, "max_budget_usd")
+        assert not hasattr(opts, "thinking")
