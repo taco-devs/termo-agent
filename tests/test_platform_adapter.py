@@ -214,7 +214,10 @@ class TestReasoningDetection:
             "reasoning" in raw_type or "reasoning" in raw_cls
             or "thinking" in raw_type or "thinking" in raw_cls
         )
-        is_func_args = "function_call_arguments" in raw_type
+        is_func_args = (
+            "function_call_arguments" in raw_type
+            or "function_call" in raw_type
+        )
         if is_reasoning_event and hasattr(raw, "delta") and isinstance(raw.delta, str):
             reasoning = raw.delta
         elif is_func_args:
@@ -224,7 +227,16 @@ class TestReasoningDetection:
         elif hasattr(raw, "choices") and raw.choices:
             d = getattr(raw.choices[0], "delta", None)
             if d:
-                delta = getattr(d, "content", None)
+                # LiteLLM/OpenRouter: check for tool_calls — if
+                # present the chunk is a function call, not text.
+                has_tool_calls = False
+                if isinstance(d, dict):
+                    has_tool_calls = bool(d.get("tool_calls"))
+                else:
+                    tc = getattr(d, "tool_calls", None)
+                    has_tool_calls = bool(tc)
+                if not has_tool_calls:
+                    delta = getattr(d, "content", None) if not isinstance(d, dict) else d.get("content")
                 reasoning = getattr(d, "reasoning_content", None) or (
                     d.get("reasoning_content") if isinstance(d, dict) else None
                 )
@@ -287,12 +299,11 @@ class TestReasoningDetection:
         assert reasoning == "Because..."
 
     def test_openrouter_dict_delta_reasoning(self):
-        """OpenRouter: delta is a dict — reasoning_content extracted via .get() fallback."""
+        """OpenRouter: delta is a dict — both content and reasoning extracted via .get()."""
         choice = SimpleNamespace(delta={"content": "Hi", "reasoning_content": "Reason"})
         raw = SimpleNamespace(choices=[choice])
         delta, reasoning = self._classify_raw(raw)
-        # getattr on dict doesn't get keys, so content=None; reasoning uses .get() fallback
-        assert delta is None
+        assert delta == "Hi"
         assert reasoning == "Reason"
 
     def test_usage_extraction(self):
@@ -336,6 +347,72 @@ class TestReasoningDetection:
         )
         delta, reasoning = self._classify_raw(raw)
         assert delta is None
+        assert reasoning is None
+
+    def test_function_call_type_not_leaked(self):
+        """Events with 'function_call' in type must be skipped."""
+        raw = SimpleNamespace(
+            type="response.output_item.added",
+            delta='{"type": "function_call"}',
+        )
+        # Actually this wouldn't match since "function_call" not in
+        # "response.output_item.added". Test the actual matching type:
+        raw2 = SimpleNamespace(
+            type="response.function_call.delta",
+            delta='{"name": "run_command"}',
+        )
+        delta, reasoning = self._classify_raw(raw2)
+        assert delta is None
+        assert reasoning is None
+
+    def test_litellm_choices_tool_calls_not_leaked(self):
+        """LiteLLM/OpenRouter: choices with tool_calls must NOT leak as text."""
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="run_command", arguments='{"command": "echo hi"}')
+        )
+        choice = SimpleNamespace(
+            delta=SimpleNamespace(content=None, reasoning_content=None, tool_calls=[tool_call])
+        )
+        raw = SimpleNamespace(choices=[choice])
+        delta, reasoning = self._classify_raw(raw)
+        assert delta is None
+        assert reasoning is None
+
+    def test_litellm_choices_tool_calls_with_content_not_leaked(self):
+        """LiteLLM: even if content is set alongside tool_calls, suppress text."""
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="remember", arguments='{"content": "test"}')
+        )
+        choice = SimpleNamespace(
+            delta=SimpleNamespace(
+                content='{"content": "test"}',
+                reasoning_content=None,
+                tool_calls=[tool_call],
+            )
+        )
+        raw = SimpleNamespace(choices=[choice])
+        delta, reasoning = self._classify_raw(raw)
+        assert delta is None
+        assert reasoning is None
+
+    def test_litellm_choices_dict_tool_calls_not_leaked(self):
+        """LiteLLM: dict delta with tool_calls must NOT leak."""
+        choice = SimpleNamespace(
+            delta={"content": None, "tool_calls": [{"function": {"arguments": '{"x":1}'}}]}
+        )
+        raw = SimpleNamespace(choices=[choice])
+        delta, reasoning = self._classify_raw(raw)
+        assert delta is None
+        assert reasoning is None
+
+    def test_litellm_choices_no_tool_calls_passes_text(self):
+        """LiteLLM: choices without tool_calls should still pass text through."""
+        choice = SimpleNamespace(
+            delta=SimpleNamespace(content="Hello", reasoning_content=None, tool_calls=None)
+        )
+        raw = SimpleNamespace(choices=[choice])
+        delta, reasoning = self._classify_raw(raw)
+        assert delta == "Hello"
         assert reasoning is None
 
 

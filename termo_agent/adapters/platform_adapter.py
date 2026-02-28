@@ -1172,7 +1172,10 @@ class Adapter(AgentAdapter):
                         or "thinking" in raw_type or "thinking" in raw_cls
                     )
                     # Skip function call argument deltas — they are NOT text content
-                    is_func_args = "function_call_arguments" in raw_type
+                    is_func_args = (
+                        "function_call_arguments" in raw_type
+                        or "function_call" in raw_type
+                    )
                     if is_reasoning_event and hasattr(raw, "delta") and isinstance(raw.delta, str):
                         reasoning = raw.delta
                     elif is_func_args:
@@ -1182,7 +1185,16 @@ class Adapter(AgentAdapter):
                     elif hasattr(raw, "choices") and raw.choices:
                         d = getattr(raw.choices[0], "delta", None)
                         if d:
-                            delta = getattr(d, "content", None)
+                            # LiteLLM/OpenRouter: check for tool_calls — if
+                            # present the chunk is a function call, not text.
+                            has_tool_calls = False
+                            if isinstance(d, dict):
+                                has_tool_calls = bool(d.get("tool_calls"))
+                            else:
+                                tc = getattr(d, "tool_calls", None)
+                                has_tool_calls = bool(tc)
+                            if not has_tool_calls:
+                                delta = getattr(d, "content", None) if not isinstance(d, dict) else d.get("content")
                             reasoning = getattr(d, "reasoning_content", None) or (
                                 d.get("reasoning_content") if isinstance(d, dict) else None
                             )
