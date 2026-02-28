@@ -214,8 +214,11 @@ class TestReasoningDetection:
             "reasoning" in raw_type or "reasoning" in raw_cls
             or "thinking" in raw_type or "thinking" in raw_cls
         )
+        is_func_args = "function_call_arguments" in raw_type
         if is_reasoning_event and hasattr(raw, "delta") and isinstance(raw.delta, str):
             reasoning = raw.delta
+        elif is_func_args:
+            pass  # tool call JSON chunks, not display text
         elif hasattr(raw, "delta") and isinstance(raw.delta, str):
             delta = raw.delta
         elif hasattr(raw, "choices") and raw.choices:
@@ -313,6 +316,26 @@ class TestReasoningDetection:
         raw = SimpleNamespace(type="", delta="Some text")
         delta, reasoning = self._classify_raw(raw)
         assert delta == "Some text"
+        assert reasoning is None
+
+    def test_function_call_arguments_not_leaked(self):
+        """Function call argument deltas must NOT appear as text."""
+        raw = SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            delta='{"command": "echo hello"}',
+        )
+        delta, reasoning = self._classify_raw(raw)
+        assert delta is None
+        assert reasoning is None
+
+    def test_function_call_arguments_done_not_leaked(self):
+        """function_call_arguments.done events must also be skipped."""
+        raw = SimpleNamespace(
+            type="response.function_call_arguments.done",
+            delta='{"command": "ls"}',
+        )
+        delta, reasoning = self._classify_raw(raw)
+        assert delta is None
         assert reasoning is None
 
 

@@ -25,9 +25,12 @@ from dotenv import load_dotenv
 
 from termo_agent.adapter import AgentAdapter, StreamEvent
 
-load_dotenv(Path(__file__).parent / ".env")
+# Resolve agent dir: when installed as a pip package, __file__ points to
+# the package directory, not the sprite's agent dir.  Use TERMO_AGENT_DIR
+# env var or fall back to the well-known sprite path.
+AGENT_DIR = Path(os.environ.get("TERMO_AGENT_DIR", "/home/sprite/agent"))
+load_dotenv(AGENT_DIR / ".env")
 
-AGENT_DIR = Path(__file__).parent
 SESSIONS_DIR = AGENT_DIR / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 WORKSPACE = Path("/home/sprite/workspace")
@@ -1168,8 +1171,12 @@ class Adapter(AgentAdapter):
                         "reasoning" in raw_type or "reasoning" in raw_cls
                         or "thinking" in raw_type or "thinking" in raw_cls
                     )
+                    # Skip function call argument deltas — they are NOT text content
+                    is_func_args = "function_call_arguments" in raw_type
                     if is_reasoning_event and hasattr(raw, "delta") and isinstance(raw.delta, str):
                         reasoning = raw.delta
+                    elif is_func_args:
+                        pass  # tool call JSON chunks, not display text
                     elif hasattr(raw, "delta") and isinstance(raw.delta, str):
                         delta = raw.delta
                     elif hasattr(raw, "choices") and raw.choices:

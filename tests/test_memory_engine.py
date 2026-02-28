@@ -82,10 +82,15 @@ from termo_agent.adapters import memory_engine as me
 
 
 @pytest.fixture(autouse=True)
-def _reset_module():
-    """Reset memory_engine singletons between tests."""
+def _reset_module(tmp_path):
+    """Reset memory_engine singletons and point AGENT_DIR to a temp dir."""
     me._client = None
     me._collection = None
+    # Point module paths to tmp so mkdir/file ops don't hit /home/sprite
+    me.AGENT_DIR = tmp_path
+    me.MEMORY_DIR = tmp_path / "memory"
+    me.CHROMA_DIR = tmp_path / "memory" / "chromadb"
+    me.LEGACY_FILE = tmp_path / "memory" / "memory.md"
     yield
     me._client = None
     me._collection = None

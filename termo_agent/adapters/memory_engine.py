@@ -1,6 +1,7 @@
 """Semantic memory backed by ChromaDB with external embeddings."""
 
 import json
+import os
 import re
 import urllib.request
 from datetime import datetime, timezone
@@ -10,7 +11,9 @@ from uuid import uuid4
 import chromadb
 from chromadb import Documents, Embeddings, EmbeddingFunction
 
-AGENT_DIR = Path(__file__).parent
+# Resolve agent dir: when installed as a pip package, __file__ points to
+# the package directory, not the sprite's agent dir.
+AGENT_DIR = Path(os.environ.get("TERMO_AGENT_DIR", "/home/sprite/agent"))
 MEMORY_DIR = AGENT_DIR / "memory"
 CHROMA_DIR = MEMORY_DIR / "chromadb"
 LEGACY_FILE = MEMORY_DIR / "memory.md"
