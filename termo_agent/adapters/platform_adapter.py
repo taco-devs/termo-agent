@@ -812,14 +812,16 @@ def _define_tools(browser_enabled: bool = False):
     def _capture_screenshot() -> str:
         """Capture screenshot via PinchTab and save to workspace. Returns markdown image link or empty string."""
         try:
+            import base64 as _b64
             with urllib.request.urlopen(f"{PINCHTAB_URL}/screenshot", timeout=10) as resp:
-                png_data = resp.read()
+                payload = json.loads(resp.read())
+            img_data = _b64.b64decode(payload["base64"])
             ts = int(_time.time() * 1000)
             screenshots_dir = Path("/home/sprite/workspace/screenshots")
             screenshots_dir.mkdir(parents=True, exist_ok=True)
-            path = screenshots_dir / f"{ts}.png"
-            path.write_bytes(png_data)
-            return f"\n\n![screenshot](/workspace/screenshots/{ts}.png)"
+            path = screenshots_dir / f"{ts}.jpg"
+            path.write_bytes(img_data)
+            return f"\n\n![screenshot](/workspace/screenshots/{ts}.jpg)"
         except Exception:
             return ""
 
