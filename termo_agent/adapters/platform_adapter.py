@@ -809,6 +809,20 @@ def _define_tools(browser_enabled: bool = False):
 
     # --- Browser tools (PinchTab) ---
 
+    def _capture_screenshot() -> str:
+        """Capture screenshot via PinchTab and save to workspace. Returns markdown image link or empty string."""
+        try:
+            with urllib.request.urlopen(f"{PINCHTAB_URL}/screenshot", timeout=10) as resp:
+                png_data = resp.read()
+            ts = int(_time.time() * 1000)
+            screenshots_dir = Path("/home/sprite/workspace/screenshots")
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            path = screenshots_dir / f"{ts}.png"
+            path.write_bytes(png_data)
+            return f"\n\n![screenshot](/workspace/screenshots/{ts}.png)"
+        except Exception:
+            return ""
+
     @function_tool
     def browse(url: str) -> str:
         """Navigate to a URL and return the page text. Use for reading web pages,
@@ -826,7 +840,8 @@ def _define_tools(browser_enabled: bool = False):
             text = data.get("text", "")
             if len(text) > 8000:
                 text = text[:8000] + "\n... [truncated]"
-            return text or "[empty page]"
+            screenshot_md = _capture_screenshot()
+            return (text or "[empty page]") + screenshot_md
         except Exception as e:
             return f"[error: {e}]"
 
@@ -867,7 +882,9 @@ def _define_tools(browser_enabled: bool = False):
             with urllib.request.urlopen(
                 f"{PINCHTAB_URL}/snapshot?format=text&filter=interactive", timeout=10
             ) as resp:
-                return resp.read().decode()[:4000] or "[page updated]"
+                elements = resp.read().decode()[:4000] or "[page updated]"
+            screenshot_md = _capture_screenshot()
+            return elements + screenshot_md
         except Exception as e:
             return f"[error: {e}]"
 
