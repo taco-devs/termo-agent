@@ -737,6 +737,73 @@ def _define_tools():
 
         return f"[uninstalled '{slug}']"
 
+    @function_tool
+    def list_agents() -> str:
+        """List other agents owned by your user that you can communicate with.
+        Returns their names, slugs, status, and descriptions so you can decide
+        which agent to call."""
+        api_url = os.environ.get("TERMO_API_URL", "")
+        token = os.environ.get("TERMO_TOKEN", "")
+        if not api_url or not token:
+            return "[error: TERMO_API_URL or TERMO_TOKEN not configured]"
+        try:
+            payload = json.dumps({"token": token}).encode()
+            req = urllib.request.Request(
+                f"{api_url}/agents/list-siblings",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            return f"[error: {e}]"
+
+        agents = data.get("agents", [])
+        if not agents:
+            return "[no sibling agents found]"
+        lines = []
+        for a in agents:
+            desc = f" — {a['description']}" if a.get("description") else ""
+            lines.append(f"- **{a['name']}** (`{a['slug']}`) [{a['status']}] model: {a.get('model', '?')}{desc}")
+        return f"Found {len(agents)} sibling agent(s):\n" + "\n".join(lines)
+
+    @function_tool
+    def call_agent(agent_slug: str, message: str) -> str:
+        """Send a message to a sibling agent and receive their response. Use this
+        to collaborate with, delegate to, or get information from another agent.
+        Use list_agents first to discover available agents and their slugs."""
+        api_url = os.environ.get("TERMO_API_URL", "")
+        token = os.environ.get("TERMO_TOKEN", "")
+        if not api_url or not token:
+            return "[error: TERMO_API_URL or TERMO_TOKEN not configured]"
+        if not agent_slug or not message:
+            return "[error: agent_slug and message are required]"
+        try:
+            payload = json.dumps({
+                "token": token,
+                "target_slug": agent_slug,
+                "message": message,
+                "depth": 1,
+            }).encode()
+            req = urllib.request.Request(
+                f"{api_url}/agents/call-agent",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=130) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            return f"[error {e.code}: {body[:500]}]"
+        except Exception as e:
+            return f"[error: {e}]"
+
+        response_text = data.get("response", "")
+        duration = data.get("duration_ms", 0)
+        return f"[response from '{agent_slug}' ({duration}ms)]\n\n{response_text}"
+
     # Return all tools as a dict
     return {
         "execute_command": execute_command,
@@ -759,6 +826,8 @@ def _define_tools():
         "install_skill": install_skill,
         "load_skill": load_skill,
         "uninstall_skill": uninstall_skill,
+        "list_agents": list_agents,
+        "call_agent": call_agent,
     }
 
 
@@ -1349,6 +1418,8 @@ class Adapter(AgentAdapter):
             {"name": "launch_task", "description": "Launch a focused subtask with its own context"},
             {"name": "search_skills", "description": "Search the skill marketplace"},
             {"name": "install_skill", "description": "Install a skill into long-term memory"},
+            {"name": "list_agents", "description": "List other agents you can communicate with"},
+            {"name": "call_agent", "description": "Send a message to another agent and get their response"},
         ]
 
     # --- System ---
