@@ -1036,7 +1036,9 @@ class Adapter(AgentAdapter):
         if model_name.startswith("openrouter/"):
             model_name = model_name[len("openrouter/"):]
 
-        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+        agent_id = os.environ.get("TERMO_AGENT_ID", "")
+        default_headers = {"X-Agent-Id": agent_id} if agent_id else {}
+        client = AsyncOpenAI(api_key=api_key, base_url=api_base, default_headers=default_headers)
         return OpenAIChatCompletionsModel(model=model_name, openai_client=client)
 
     def _build_launch_task(self):
