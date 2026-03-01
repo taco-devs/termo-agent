@@ -1021,6 +1021,10 @@ class Adapter(AgentAdapter):
         # Add launch_task (needs tools + model ref)
         self._build_launch_task()
 
+        # Initialize Telegram webhook handler if channels are configured
+        from termo_agent import telegram_webhook
+        telegram_webhook.setup(self, self.config)
+
     def _get_model(self):
         from openai import AsyncOpenAI
         from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
@@ -1538,13 +1542,19 @@ class Adapter(AgentAdapter):
     # --- Extra routes ---
 
     def extra_routes(self) -> list:
-        return [
+        from termo_agent import telegram_webhook
+        routes = [
             ("POST", "/api/memory/search", self._handle_search_memory),
             ("GET", "/workspace/{path:.*}", self._handle_workspace_file),
         ]
+        routes.extend(telegram_webhook.get_routes())
+        return routes
 
     def public_route_prefixes(self) -> list[str]:
-        return ["/health", "/workspace/"]
+        from termo_agent import telegram_webhook
+        prefixes = ["/health", "/workspace/"]
+        prefixes.extend(telegram_webhook.get_public_prefixes())
+        return prefixes
 
     # --- Extra route handlers ---
 
