@@ -37,6 +37,7 @@
 - **Adapter Pattern** &mdash; Plug in OpenAI Agents SDK, LangChain, CrewAI, or your own framework
 - **Memory** &mdash; Built-in memory endpoints for semantic long-term storage
 - **Heartbeat** &mdash; Periodic autonomous tasks that run on a schedule
+- **Browser Tools** &mdash; Optional Chrome + PinchTab integration for navigating JS-heavy sites
 - **Extra Routes** &mdash; Adapters can declare custom HTTP endpoints
 - **Zero Config Deploy** &mdash; One command to install, one command to run
 
@@ -163,6 +164,18 @@ data: {"type": "done", "content": "Hello there! Here's what I found...", "usage"
 │                  Sessions    Custom / etc.   │
 └─────────────────────────────────────────────┘
 ```
+
+## Browser Tools
+
+Agents with `browser_enabled: true` in their config get access to three tools powered by [PinchTab](https://pinchtab.com):
+
+| Tool | Description |
+|------|-------------|
+| `browse(url)` | Navigate to a URL and return page text (~800 tokens). Supports JS-rendered content. |
+| `browse_observe()` | Get interactive elements on the current page with stable refs (e0, e1...). |
+| `browse_act(ref, action, value)` | Click, type, fill, press, or scroll on an element by ref. |
+
+Browser tools are conditionally loaded — agents without `browser_enabled` pay zero extra tokens.
 
 ## Deploy to Termo
 

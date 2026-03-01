@@ -250,7 +250,10 @@ def _detect_categories(message: str, session_messages: list | None = None) -> li
 # ---------------------------------------------------------------------------
 
 
-def _define_tools():
+PINCHTAB_URL = "http://localhost:9867"
+
+
+def _define_tools(browser_enabled: bool = False):
     """Define all function_tool tools. Called once during initialize()."""
     from agents import function_tool
 
@@ -804,8 +807,72 @@ def _define_tools():
         duration = data.get("duration_ms", 0)
         return f"[response from '{agent_slug}' ({duration}ms)]\n\n{response_text}"
 
+    # --- Browser tools (PinchTab) ---
+
+    @function_tool
+    def browse(url: str) -> str:
+        """Navigate to a URL and return the page text. Use for reading web pages,
+        documentation, or any URL. Supports JavaScript-rendered content."""
+        try:
+            req = urllib.request.Request(
+                f"{PINCHTAB_URL}/navigate",
+                data=json.dumps({"url": url}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=30)
+            with urllib.request.urlopen(f"{PINCHTAB_URL}/text", timeout=10) as resp:
+                data = json.loads(resp.read())
+            text = data.get("text", "")
+            if len(text) > 8000:
+                text = text[:8000] + "\n... [truncated]"
+            return text or "[empty page]"
+        except Exception as e:
+            return f"[error: {e}]"
+
+    @function_tool
+    def browse_observe() -> str:
+        """Get interactive elements on the current page. Returns elements with
+        refs (e0, e1...) you can use with browse_act. Call after browse() to
+        see what you can click, type into, or select."""
+        try:
+            with urllib.request.urlopen(
+                f"{PINCHTAB_URL}/snapshot?format=text&filter=interactive", timeout=10
+            ) as resp:
+                return resp.read().decode()[:4000] or "[no interactive elements]"
+        except Exception as e:
+            return f"[error: {e}]"
+
+    @function_tool
+    def browse_act(ref: str, action: str, value: str = "") -> str:
+        """Interact with a page element by ref from browse_observe().
+        action: click, type, fill, press, scroll. value: text to type or key to press.
+        Returns updated interactive elements."""
+        try:
+            payload: dict = {"ref": ref, "kind": action}
+            if value:
+                if action in ("fill", "type"):
+                    payload["value"] = value
+                elif action == "press":
+                    payload["key"] = value
+                else:
+                    payload["value"] = value
+            req = urllib.request.Request(
+                f"{PINCHTAB_URL}/action",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=15)
+            with urllib.request.urlopen(
+                f"{PINCHTAB_URL}/snapshot?format=text&filter=interactive", timeout=10
+            ) as resp:
+                return resp.read().decode()[:4000] or "[page updated]"
+        except Exception as e:
+            return f"[error: {e}]"
+
     # Return all tools as a dict
-    return {
+    tools = {
         "execute_command": execute_command,
         "read_file": read_file,
         "write_file": write_file,
@@ -829,6 +896,13 @@ def _define_tools():
         "list_agents": list_agents,
         "call_agent": call_agent,
     }
+
+    if browser_enabled:
+        tools["browse"] = browse
+        tools["browse_observe"] = browse_observe
+        tools["browse_act"] = browse_act
+
+    return tools
 
 
 # ---------------------------------------------------------------------------
@@ -921,8 +995,8 @@ class Adapter(AgentAdapter):
         if soul_file.exists():
             self.soul_md = soul_file.read_text()
 
-        # Define all tools
-        self._tools = _define_tools()
+        # Define all tools (browser tools conditional on config)
+        self._tools = _define_tools(browser_enabled=self.config.get("browser_enabled", False))
         self._tool_list = list(self._tools.values())
 
         # Add launch_task (needs tools + model ref)
@@ -1398,7 +1472,7 @@ class Adapter(AgentAdapter):
     # --- Tools ---
 
     async def list_tools(self) -> list[dict]:
-        return [
+        tools = [
             {"name": "execute_command", "description": "Execute a shell command"},
             {"name": "read_file", "description": "Read a file's contents"},
             {"name": "write_file", "description": "Write content to a file"},
@@ -1421,6 +1495,13 @@ class Adapter(AgentAdapter):
             {"name": "list_agents", "description": "List other agents you can communicate with"},
             {"name": "call_agent", "description": "Send a message to another agent and get their response"},
         ]
+        if self.config.get("browser_enabled"):
+            tools.extend([
+                {"name": "browse", "description": "Navigate to a URL and read the page"},
+                {"name": "browse_observe", "description": "Get interactive elements on the current page"},
+                {"name": "browse_act", "description": "Click, type, or interact with a page element"},
+            ])
+        return tools
 
     # --- System ---
 
