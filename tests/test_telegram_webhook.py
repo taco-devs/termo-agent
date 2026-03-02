@@ -42,22 +42,33 @@ class TestTelegramHelpers:
 
         assert sent[0] == "(empty response)"
 
-    def test_send_telegram_message_markdown_fallback(self):
-        """If MarkdownV2 fails, should fall back to plain text."""
+    def test_send_telegram_message_html_fallback(self):
+        """If HTML parse fails, should fall back to plain text."""
         call_count = 0
 
         def mock_request(bot_token, method, payload=None, timeout=10):
             nonlocal call_count
             call_count += 1
-            if payload and payload.get("parse_mode") == "MarkdownV2":
+            if payload and payload.get("parse_mode") == "HTML":
                 return {"ok": False, "error": "parse error"}
             return {"ok": True}
 
         with patch.object(telegram_webhook, "_telegram_request", side_effect=mock_request):
-            result = telegram_webhook._send_telegram_message("token", 123, "test *bad markdown")
+            result = telegram_webhook._send_telegram_message("token", 123, "test **bold**")
 
         assert call_count == 2
         assert result["ok"]
+
+    def test_md_to_telegram_html_converts_bold(self):
+        """Markdown bold should become HTML bold."""
+        result = telegram_webhook._md_to_telegram_html("Hello **world**!")
+        assert "<b>world</b>" in result
+
+    def test_md_to_telegram_html_escapes_html(self):
+        """Raw HTML in text should be escaped."""
+        result = telegram_webhook._md_to_telegram_html("Use <script> tag")
+        assert "&lt;script&gt;" in result
+        assert "<script>" not in result
 
 
 # --- Module setup tests ---

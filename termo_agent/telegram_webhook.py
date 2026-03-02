@@ -90,12 +90,37 @@ def _send_typing(bot_token: str, chat_id: int) -> None:
     _telegram_request(bot_token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
 
+def _md_to_telegram_html(text: str) -> str:
+    """Convert LLM markdown to Telegram-compatible HTML.
+
+    Escapes HTML entities first, then converts markdown patterns to tags.
+    Telegram supports: <b>, <i>, <code>, <pre>, <s>, <a>.
+    """
+    import re
+
+    # Step 1: escape raw HTML so angle brackets in text don't break parsing
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Step 2: convert markdown patterns to HTML tags
+    # Code blocks first (before inline patterns eat backticks)
+    text = re.sub(r'```(?:\w*\n)?(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+    # Inline code
+    text = re.sub(r'`([^`]+?)`', r'<code>\1</code>', text)
+    # Bold: **text**
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # Strikethrough: ~~text~~
+    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+
+    return text
+
+
 def _send_telegram_message(bot_token: str, chat_id: int, text: str) -> dict:
-    """Send a single message to Telegram. Tries MarkdownV2 first, falls back to plain text."""
+    """Send a single message to Telegram. Converts markdown to HTML for formatting."""
+    html_text = _md_to_telegram_html(text)
     result = _telegram_request(bot_token, "sendMessage", {
         "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "MarkdownV2",
+        "text": html_text,
+        "parse_mode": "HTML",
     })
     if not result.get("ok"):
         # Fallback to plain text on parse error
