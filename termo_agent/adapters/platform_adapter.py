@@ -191,8 +191,8 @@ def _extract_and_save_memories(user_message: str, assistant_response: str, sessi
             session_context=session_context,
         )
 
-        api_base = config.get("api_base", "https://api.termo.ai/v1")
-        api_key = config.get("api_key", "")
+        api_base = os.environ.get("TERMO_API_BASE") or config.get("api_base", "https://api.termo.ai/v1")
+        api_key = os.environ.get("TERMO_API_KEY") or config.get("api_key", "")
 
         payload = json.dumps({
             "model": "google/gemini-2.5-flash",
@@ -1161,11 +1161,11 @@ class Adapter(AgentAdapter):
         from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 
         model_name = self.config.get("model", "openrouter/google/gemini-2.0-flash-001")
-        api_key = self.config.get("api_key", "")
-        api_base = self.config.get("api_base", "")
+        api_key = os.environ.get("TERMO_API_KEY") or self.config.get("api_key", "")
+        api_base = os.environ.get("TERMO_API_BASE") or self.config.get("api_base", "")
 
         if not api_base:
-            raise ValueError("api_base is required in config — agent must route through the Termo proxy")
+            raise ValueError("TERMO_API_BASE env var or api_base config is required — agent must route through the Termo proxy")
 
         # Strip openrouter/ prefix — proxy expects bare model names
         if model_name.startswith("openrouter/"):
