@@ -24,6 +24,7 @@ _channels: list[dict] = []
 # Telegram tool context — populated during webhook handling so the tool can send messages
 _telegram_contexts: dict[str, dict] = {}   # session_key → {bot_token, chat_id}
 _telegram_tool_used: dict[str, bool] = {}  # session_key → True if tool was called
+_telegram_sent_messages: dict[str, list[str]] = {}  # session_key → [text1, text2, ...]
 
 TELEGRAM_API = "https://api.telegram.org"
 MAX_TELEGRAM_MESSAGE = 4096
@@ -167,6 +168,16 @@ def mark_telegram_tool_used(session_key: str) -> None:
 def was_telegram_tool_used(session_key: str) -> bool:
     """Check whether the send_telegram_message tool was used for this session."""
     return _telegram_tool_used.get(session_key, False)
+
+
+def record_sent_message(session_key: str, text: str) -> None:
+    """Record a message sent via the telegram tool for persistence."""
+    _telegram_sent_messages.setdefault(session_key, []).append(text)
+
+
+def get_sent_messages(session_key: str) -> list[str]:
+    """Return all messages sent via the telegram tool for this session."""
+    return _telegram_sent_messages.get(session_key, [])
 
 
 # --- Persistence (fire-and-forget to API server) ---
@@ -318,6 +329,10 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     if not was_telegram_tool_used(session_key):
         await asyncio.to_thread(_send_telegram_response, bot_token, chat_id, response)
 
+    # Use tool-sent messages for persistence if available, otherwise fall back to done content
+    sent = get_sent_messages(session_key)
+    persist_content = "\n\n".join(sent) if sent else response
+
     # Fire-and-forget persistence
     asyncio.create_task(asyncio.to_thread(
         _persist_telegram_messages,
@@ -326,7 +341,7 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
         user_id,
         user_name,
         text,
-        response,
+        persist_content,
         tool_calls=tool_calls,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
@@ -335,5 +350,6 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     # Clean up context
     _telegram_contexts.pop(session_key, None)
     _telegram_tool_used.pop(session_key, None)
+    _telegram_sent_messages.pop(session_key, None)
 
     return web.json_response({"ok": True})

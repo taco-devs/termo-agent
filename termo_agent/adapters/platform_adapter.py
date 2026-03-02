@@ -1044,6 +1044,10 @@ def _get_telegram_tool():
 
             if result.get("ok"):
                 telegram_webhook.mark_telegram_tool_used(session_key)
+                # Record the actual content sent for DB persistence
+                sent_text = text or caption or ""
+                if sent_text:
+                    telegram_webhook.record_sent_message(session_key, sent_text)
                 return "Message sent successfully"
             else:
                 return f"Telegram API error: {result.get('error', result.get('description', 'unknown'))}"
