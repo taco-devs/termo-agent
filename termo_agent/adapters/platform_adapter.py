@@ -1284,7 +1284,11 @@ class Adapter(AgentAdapter):
                 final_output = str(result.final_output) if result.final_output else "[subtask completed with no output]"
 
             except Exception as e:
-                final_output = f"[subtask error: {e}]"
+                from agents.exceptions import MaxTurnsExceeded
+                if isinstance(e, MaxTurnsExceeded):
+                    final_output = "[subtask reached processing limit (25 steps). Partial results above may still be useful.]"
+                else:
+                    final_output = f"[subtask error: {e}]"
 
             _api_call(f"{api_url}/agents/subtask/complete", {
                 "token": token,
@@ -1441,6 +1445,7 @@ class Adapter(AgentAdapter):
     async def send_message(self, message: str, session_key: str) -> str:
         global _current_conversation_id, _current_session_key
         from agents import Runner
+        from agents.exceptions import MaxTurnsExceeded
 
         parts = session_key.split(":")
         _current_conversation_id = parts[1] if len(parts) >= 2 and parts[0] != "cron" else None
@@ -1454,6 +1459,17 @@ class Adapter(AgentAdapter):
         try:
             result = await Runner.run(agent, input=trimmed, max_turns=25)
             assistant_content = str(result.final_output) if result.final_output else ""
+        except MaxTurnsExceeded:
+            _current_session_key = None
+            # Summarize what was accomplished before hitting the limit
+            assistant_content = (
+                "*I reached my processing limit for this turn (25 steps). "
+                "The work I did above has been saved. "
+                "Send me a follow-up message and I'll continue where I left off.*"
+            )
+            messages.append({"role": "assistant", "content": assistant_content})
+            _save_session(session_key, messages)
+            return assistant_content
         finally:
             _current_session_key = None
 
@@ -1577,9 +1593,26 @@ class Adapter(AgentAdapter):
 
         except Exception as e:
             _current_session_key = None
-            messages.append({"role": "assistant", "content": streamed_content or "(response interrupted)"})
-            _save_session(session_key, messages)
-            yield StreamEvent(type="error", content=str(e), metadata={"trace": traceback.format_exc()})
+            from agents.exceptions import MaxTurnsExceeded
+            if isinstance(e, MaxTurnsExceeded):
+                # Agent did real work but ran out of turns — treat as a soft completion
+                summary = (
+                    "*I reached my processing limit for this turn (25 steps). "
+                    "The work I did above has been saved. "
+                    "Send me a follow-up message and I'll continue where I left off.*"
+                )
+                final = f"{streamed_content}\n\n{summary}" if streamed_content else summary
+                messages.append({"role": "assistant", "content": final})
+                _save_session(session_key, messages)
+                yield StreamEvent(
+                    type="done",
+                    content=final,
+                    usage={"prompt_tokens": tokens_in, "completion_tokens": tokens_out},
+                )
+            else:
+                messages.append({"role": "assistant", "content": streamed_content or "(response interrupted)"})
+                _save_session(session_key, messages)
+                yield StreamEvent(type="error", content=str(e), metadata={"trace": traceback.format_exc()})
 
     # --- Sessions ---
 
