@@ -57,6 +57,9 @@ _sessions: dict[str, list] = {}
 # Current conversation context — set before each agent run so tools can read it
 _current_conversation_id: str | None = None
 
+# Current session key — set before each agent run so the telegram tool can look up context
+_current_session_key: str | None = None
+
 # Dangerous command patterns
 _DENY_PATTERNS = [
     r"\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?/\b",
@@ -97,6 +100,18 @@ Recent context:
 {session_context}
 
 Extract durable facts (JSON only):"""
+
+_TELEGRAM_SYSTEM_PROMPT = """
+## Telegram Mode
+You are responding in a Telegram chat. Follow these rules:
+- Be concise and conversational. Keep responses under 200 words unless the user asks for detail.
+- Write like a human texting — casual, direct, no walls of text.
+- Do NOT use markdown headers, bullet lists, or code blocks unless truly necessary.
+- Use the `send_telegram_message` tool to send ALL responses. Do not just return text.
+- You can send multiple messages by calling the tool multiple times.
+- For rich content: photo (URL + caption), document (URL + caption), sticker, location, or action (typing).
+- Default to type "text" for normal responses.
+"""
 
 # --- Smart memory: vague/short message detection ---
 
@@ -925,6 +940,122 @@ def _define_tools(browser_enabled: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Telegram send tool (injected only for telegram sessions)
+# ---------------------------------------------------------------------------
+
+_telegram_tool_instance = None
+
+
+def _get_telegram_tool():
+    """Return the cached send_telegram_message function_tool instance."""
+    global _telegram_tool_instance
+    if _telegram_tool_instance is not None:
+        return _telegram_tool_instance
+
+    from agents import function_tool
+
+    @function_tool
+    def send_telegram_message(
+        type: str = "text",
+        text: str = "",
+        url: str = "",
+        caption: str = "",
+        action: str = "typing",
+        latitude: float = 0.0,
+        longitude: float = 0.0,
+        parse_mode: str = "",
+    ) -> str:
+        """Send a message to the user's Telegram chat.
+
+        Args:
+            type: Message type — one of: text, photo, document, sticker, action, location.
+            text: The text content (for type=text). Supports Telegram MarkdownV2.
+            url: URL of the photo, document, or sticker (for type=photo/document/sticker).
+            caption: Caption for photo or document.
+            action: Chat action like 'typing', 'upload_photo', etc. (for type=action).
+            latitude: Latitude (for type=location).
+            longitude: Longitude (for type=location).
+            parse_mode: Optional parse mode (MarkdownV2, HTML). Leave empty for auto.
+        """
+        from termo_agent import telegram_webhook
+
+        session_key = _current_session_key
+        if not session_key:
+            return "Error: no active telegram session"
+
+        ctx = telegram_webhook.get_telegram_context(session_key)
+        if not ctx:
+            return "Error: telegram context not available"
+
+        bot_token = ctx["bot_token"]
+        chat_id = ctx["chat_id"]
+
+        try:
+            if type == "text":
+                if not text:
+                    return "Error: text is required for type=text"
+                payload = {"chat_id": chat_id, "text": text}
+                if parse_mode:
+                    payload["parse_mode"] = parse_mode
+                result = telegram_webhook._telegram_request(bot_token, "sendMessage", payload)
+                if not result.get("ok") and parse_mode:
+                    # Retry without parse_mode on format error
+                    payload.pop("parse_mode", None)
+                    result = telegram_webhook._telegram_request(bot_token, "sendMessage", payload)
+
+            elif type == "photo":
+                if not url:
+                    return "Error: url is required for type=photo"
+                payload = {"chat_id": chat_id, "photo": url}
+                if caption:
+                    payload["caption"] = caption
+                result = telegram_webhook._telegram_request(bot_token, "sendPhoto", payload)
+
+            elif type == "document":
+                if not url:
+                    return "Error: url is required for type=document"
+                payload = {"chat_id": chat_id, "document": url}
+                if caption:
+                    payload["caption"] = caption
+                result = telegram_webhook._telegram_request(bot_token, "sendDocument", payload)
+
+            elif type == "sticker":
+                if not url:
+                    return "Error: url is required for type=sticker"
+                result = telegram_webhook._telegram_request(
+                    bot_token, "sendSticker", {"chat_id": chat_id, "sticker": url}
+                )
+
+            elif type == "action":
+                result = telegram_webhook._telegram_request(
+                    bot_token, "sendChatAction", {"chat_id": chat_id, "action": action}
+                )
+
+            elif type == "location":
+                if not latitude and not longitude:
+                    return "Error: latitude and longitude are required for type=location"
+                result = telegram_webhook._telegram_request(
+                    bot_token, "sendLocation",
+                    {"chat_id": chat_id, "latitude": latitude, "longitude": longitude},
+                )
+
+            else:
+                return f"Error: unsupported message type '{type}'"
+
+            if result.get("ok"):
+                telegram_webhook.mark_telegram_tool_used(session_key)
+                return "Message sent successfully"
+            else:
+                return f"Telegram API error: {result.get('error', result.get('description', 'unknown'))}"
+
+        except Exception as e:
+            return f"Error sending telegram message: {e}"
+
+    _telegram_tool_instance = send_telegram_message
+    return _telegram_tool_instance
+
+
+# ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
@@ -1198,7 +1329,7 @@ class Adapter(AgentAdapter):
         except Exception:
             return self._skills_cache or []
 
-    def _build_agent(self, message: str = "", session_messages: list | None = None):
+    def _build_agent(self, message: str = "", session_messages: list | None = None, session_key: str = ""):
         from agents import Agent
 
         model = self._get_model()
@@ -1276,6 +1407,15 @@ class Adapter(AgentAdapter):
             if bootstrap:
                 instructions += f"\n\n## FIRST RUN — Bootstrap\n{bootstrap}"
 
+        # Inject Telegram system prompt + tool when session is a telegram chat
+        is_telegram = session_key.startswith("telegram:")
+        if is_telegram:
+            instructions += _TELEGRAM_SYSTEM_PROMPT
+
+        tools = self._tool_list[:]
+        if is_telegram:
+            tools.append(_get_telegram_tool())
+
         from agents import ModelSettings
         from openai.types.shared import Reasoning
 
@@ -1289,7 +1429,7 @@ class Adapter(AgentAdapter):
             instructions=instructions,
             model=model,
             model_settings=settings,
-            tools=self._tool_list,
+            tools=tools,
         )
 
     async def shutdown(self) -> None:
@@ -1299,19 +1439,23 @@ class Adapter(AgentAdapter):
     # --- Core messaging ---
 
     async def send_message(self, message: str, session_key: str) -> str:
-        global _current_conversation_id
+        global _current_conversation_id, _current_session_key
         from agents import Runner
 
         parts = session_key.split(":")
         _current_conversation_id = parts[1] if len(parts) >= 2 and parts[0] != "cron" else None
+        _current_session_key = session_key
 
         messages = _load_session(session_key)
-        agent = self._build_agent(message=message, session_messages=messages)
+        agent = self._build_agent(message=message, session_messages=messages, session_key=session_key)
         messages.append({"role": "user", "content": message})
 
         trimmed = _trim_messages(messages)
-        result = await Runner.run(agent, input=trimmed, max_turns=25)
-        assistant_content = str(result.final_output) if result.final_output else ""
+        try:
+            result = await Runner.run(agent, input=trimmed, max_turns=25)
+            assistant_content = str(result.final_output) if result.final_output else ""
+        finally:
+            _current_session_key = None
 
         messages.append({"role": "assistant", "content": assistant_content})
         _save_session(session_key, messages)
@@ -1324,14 +1468,15 @@ class Adapter(AgentAdapter):
         return assistant_content
 
     async def send_message_stream(self, message: str, session_key: str) -> AsyncIterator[StreamEvent]:
-        global _current_conversation_id
+        global _current_conversation_id, _current_session_key
         from agents import Runner
 
         parts = session_key.split(":")
         _current_conversation_id = parts[1] if len(parts) >= 2 and parts[0] != "cron" else None
+        _current_session_key = session_key
 
         messages = _load_session(session_key)
-        agent = self._build_agent(message=message, session_messages=messages)
+        agent = self._build_agent(message=message, session_messages=messages, session_key=session_key)
         messages.append({"role": "user", "content": message})
 
         trimmed = _trim_messages(messages)
@@ -1422,6 +1567,8 @@ class Adapter(AgentAdapter):
                 _extract_and_save_memories, message, assistant_content, session_tail, self.config
             ))
 
+            _current_session_key = None
+
             yield StreamEvent(
                 type="done",
                 content=assistant_content,
@@ -1429,6 +1576,7 @@ class Adapter(AgentAdapter):
             )
 
         except Exception as e:
+            _current_session_key = None
             messages.append({"role": "assistant", "content": streamed_content or "(response interrupted)"})
             _save_session(session_key, messages)
             yield StreamEvent(type="error", content=str(e), metadata={"trace": traceback.format_exc()})

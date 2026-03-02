@@ -20,6 +20,10 @@ log = logging.getLogger("termo.telegram")
 _adapter = None
 _channels: list[dict] = []
 
+# Telegram tool context — populated during webhook handling so the tool can send messages
+_telegram_contexts: dict[str, dict] = {}   # session_key → {bot_token, chat_id}
+_telegram_tool_used: dict[str, bool] = {}  # session_key → True if tool was called
+
 TELEGRAM_API = "https://api.telegram.org"
 MAX_TELEGRAM_MESSAGE = 4096
 
@@ -122,6 +126,23 @@ def _send_telegram_response(bot_token: str, chat_id: int, text: str) -> None:
         _send_telegram_message(bot_token, chat_id, chunk)
 
 
+# --- Telegram tool context helpers ---
+
+def get_telegram_context(session_key: str) -> dict | None:
+    """Return {bot_token, chat_id} for a session, or None if not in a telegram webhook call."""
+    return _telegram_contexts.get(session_key)
+
+
+def mark_telegram_tool_used(session_key: str) -> None:
+    """Mark that the send_telegram_message tool was used for this session."""
+    _telegram_tool_used[session_key] = True
+
+
+def was_telegram_tool_used(session_key: str) -> bool:
+    """Check whether the send_telegram_message tool was used for this session."""
+    return _telegram_tool_used.get(session_key, False)
+
+
 # --- Persistence (fire-and-forget to API server) ---
 
 def _persist_telegram_messages(
@@ -211,14 +232,20 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
 
     # Process message through adapter's LLM pipeline
     session_key = f"telegram:{chat_id}"
+
+    # Store context so the telegram tool can send messages during the LLM run
+    _telegram_contexts[session_key] = {"bot_token": bot_token, "chat_id": chat_id}
+    _telegram_tool_used[session_key] = False
+
     try:
         response = await _adapter.send_message(text, session_key)
     except Exception as e:
         log.error("Adapter error for telegram:%s: %s", chat_id, e)
         response = "Sorry, I encountered an error processing your message."
 
-    # Send response back to Telegram
-    await asyncio.to_thread(_send_telegram_response, bot_token, chat_id, response)
+    # Only send the fallback text response if the tool didn't already send messages
+    if not was_telegram_tool_used(session_key):
+        await asyncio.to_thread(_send_telegram_response, bot_token, chat_id, response)
 
     # Fire-and-forget persistence
     asyncio.create_task(asyncio.to_thread(
@@ -230,5 +257,9 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
         text,
         response,
     ))
+
+    # Clean up context
+    _telegram_contexts.pop(session_key, None)
+    _telegram_tool_used.pop(session_key, None)
 
     return web.json_response({"ok": True})

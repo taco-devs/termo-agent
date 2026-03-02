@@ -262,3 +262,91 @@ async def test_adapter_error_sends_fallback():
             assert "error" in error_msg.lower()
     finally:
         _teardown_module()
+
+
+# --- Telegram tool context tests ---
+
+
+@pytest.mark.asyncio
+async def test_telegram_context_set_during_send_message():
+    """Context dicts should be populated during adapter call and cleaned up after."""
+    captured_context = {}
+
+    async def capture_context(text, session_key):
+        # During the adapter call, context should be set
+        captured_context["ctx"] = telegram_webhook.get_telegram_context(session_key)
+        captured_context["session_key"] = session_key
+        return "response"
+
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message = AsyncMock(side_effect=capture_context)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    _setup_module(mock_adapter)
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response"), \
+                 patch.object(telegram_webhook, "_persist_telegram_messages"):
+                resp = await client.post("/webhooks/telegram", json=_make_update(chat_id=99))
+                assert resp.status == 200
+
+        # During the call, context should have been available
+        assert captured_context["ctx"] is not None
+        assert captured_context["ctx"]["bot_token"] == "test-bot-token"
+        assert captured_context["ctx"]["chat_id"] == 99
+
+        # After the call, context should be cleaned up
+        assert telegram_webhook.get_telegram_context("telegram:99") is None
+    finally:
+        _teardown_module()
+
+
+@pytest.mark.asyncio
+async def test_fallback_skipped_when_tool_used():
+    """_send_telegram_response should NOT be called when the tool already sent messages."""
+
+    async def fake_send(text, session_key):
+        # Simulate the tool being used during the LLM run
+        telegram_webhook.mark_telegram_tool_used(session_key)
+        return "tool already sent this"
+
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message = AsyncMock(side_effect=fake_send)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    _setup_module(mock_adapter)
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response") as mock_send, \
+                 patch.object(telegram_webhook, "_persist_telegram_messages"):
+                resp = await client.post("/webhooks/telegram", json=_make_update())
+                assert resp.status == 200
+
+            # Fallback should NOT have been called
+            mock_send.assert_not_called()
+    finally:
+        _teardown_module()
+
+
+@pytest.mark.asyncio
+async def test_fallback_sent_when_tool_not_used():
+    """_send_telegram_response should be called normally when tool was not used."""
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message = AsyncMock(return_value="Normal response")
+    mock_adapter.config = {"persona_name": "TestBot"}
+    _setup_module(mock_adapter)
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response") as mock_send, \
+                 patch.object(telegram_webhook, "_persist_telegram_messages"):
+                resp = await client.post("/webhooks/telegram", json=_make_update())
+                assert resp.status == 200
+
+            # Fallback SHOULD have been called since tool wasn't used
+            mock_send.assert_called_once_with("test-bot-token", 42, "Normal response")
+    finally:
+        _teardown_module()
