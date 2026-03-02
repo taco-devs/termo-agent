@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.error
 
@@ -177,6 +178,9 @@ def _persist_telegram_messages(
     external_user_name: str,
     user_message: str,
     assistant_message: str,
+    tool_calls: list[dict] | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
 ) -> None:
     """POST message pair to the API server for DB persistence."""
     api_url = os.environ.get("TERMO_API_URL", "")
@@ -193,6 +197,9 @@ def _persist_telegram_messages(
         "external_user_name": external_user_name,
         "user_message": user_message,
         "assistant_message": assistant_message,
+        "tool_calls": tool_calls or [],
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
     }).encode()
 
     try:
@@ -255,17 +262,56 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     # Send typing indicator
     asyncio.create_task(asyncio.to_thread(_send_typing, bot_token, chat_id))
 
-    # Process message through adapter's LLM pipeline
+    # Process message through adapter's LLM pipeline (streaming to capture tool calls)
     session_key = f"telegram:{chat_id}"
 
     # Store context so the telegram tool can send messages during the LLM run
     _telegram_contexts[session_key] = {"bot_token": bot_token, "chat_id": chat_id}
     _telegram_tool_used[session_key] = False
 
+    response = ""
+    tool_calls = []
+    tokens_in = 0
+    tokens_out = 0
+    _active_tools: dict[str, dict] = {}  # call_id → {name, input, start_time}
+    _last_typing = time.monotonic()
+
     try:
-        response = await _adapter.send_message(text, session_key)
+        async for event in _adapter.send_message_stream(text, session_key):
+            # Re-send typing every 4 seconds during long tool runs
+            now_mono = time.monotonic()
+            if now_mono - _last_typing > 4:
+                asyncio.create_task(asyncio.to_thread(_send_typing, bot_token, chat_id))
+                _last_typing = now_mono
+
+            if event.type == "tool_start":
+                call_id = event.metadata.get("call_id", "")
+                _active_tools[call_id] = {
+                    "name": event.name,
+                    "input": event.metadata.get("input", {}),
+                    "start_time": time.time(),
+                }
+
+            elif event.type == "tool_end":
+                call_id = event.metadata.get("call_id", "")
+                started = _active_tools.pop(call_id, None)
+                if started:
+                    duration_ms = int((time.time() - started["start_time"]) * 1000)
+                    tool_calls.append({
+                        "name": started["name"],
+                        "input": started["input"],
+                        "output": event.metadata.get("output", ""),
+                        "duration_ms": duration_ms,
+                    })
+
+            elif event.type == "done":
+                response = event.content or ""
+                usage = event.usage or {}
+                tokens_in = usage.get("prompt_tokens", 0)
+                tokens_out = usage.get("completion_tokens", 0)
+
     except Exception as e:
-        log.error("Adapter error for telegram:%s: %s", chat_id, e)
+        log.error("Adapter streaming error for telegram:%s: %s", chat_id, e)
         response = "Sorry, I encountered an error processing your message."
 
     # Only send the fallback text response if the tool didn't already send messages
@@ -281,6 +327,9 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
         user_name,
         text,
         response,
+        tool_calls=tool_calls,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
     ))
 
     # Clean up context

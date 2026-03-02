@@ -8,6 +8,27 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer, TestClient
 
 from termo_agent import telegram_webhook
+from termo_agent.adapter import StreamEvent
+
+
+# --- Async generator helpers for send_message_stream mocks ---
+
+async def _stream_simple(text, session_key, content="Hello from the agent!"):
+    """Yield a simple done event (no tools)."""
+    yield StreamEvent(type="done", content=content, usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+
+async def _stream_with_tools(text, session_key):
+    """Yield tool_start, tool_end, then done."""
+    yield StreamEvent(type="tool_start", name="execute_command", metadata={"call_id": "c1", "input": {"command": "ls"}})
+    yield StreamEvent(type="tool_end", name="execute_command", metadata={"call_id": "c1", "output": "file.txt\n"})
+    yield StreamEvent(type="done", content="Here are the files.", usage={"prompt_tokens": 50, "completion_tokens": 20})
+
+
+async def _stream_error(text, session_key):
+    """Raise during streaming."""
+    raise Exception("LLM streaming error")
+    yield  # make it a generator  # noqa: unreachable
 
 
 # --- Unit tests for helper functions ---
@@ -161,9 +182,9 @@ def _teardown_module():
 
 @pytest.mark.asyncio
 async def test_normal_message():
-    """Normal text message should call adapter.send_message and return ok."""
+    """Normal text message should stream through adapter and return ok."""
     mock_adapter = AsyncMock()
-    mock_adapter.send_message = AsyncMock(return_value="Hello from the agent!")
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_simple)
     mock_adapter.config = {"persona_name": "TestBot"}
     _setup_module(mock_adapter)
 
@@ -177,7 +198,7 @@ async def test_normal_message():
                 data = await resp.json()
                 assert data["ok"] is True
 
-            mock_adapter.send_message.assert_awaited_once_with("Hello", "telegram:42")
+            mock_adapter.send_message_stream.assert_called_once_with("Hello", "telegram:42")
             mock_send.assert_called_once_with("test-bot-token", 42, "Hello from the agent!")
     finally:
         _teardown_module()
@@ -254,9 +275,9 @@ async def test_no_channels_configured():
 
 @pytest.mark.asyncio
 async def test_adapter_error_sends_fallback():
-    """If adapter raises, should send an error message back to Telegram."""
+    """If adapter streaming raises, should send an error message back to Telegram."""
     mock_adapter = AsyncMock()
-    mock_adapter.send_message = AsyncMock(side_effect=Exception("LLM error"))
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_error)
     mock_adapter.config = {"persona_name": "TestBot"}
     _setup_module(mock_adapter)
 
@@ -279,18 +300,18 @@ async def test_adapter_error_sends_fallback():
 
 
 @pytest.mark.asyncio
-async def test_telegram_context_set_during_send_message():
-    """Context dicts should be populated during adapter call and cleaned up after."""
+async def test_telegram_context_set_during_streaming():
+    """Context dicts should be populated during streaming and cleaned up after."""
     captured_context = {}
 
-    async def capture_context(text, session_key):
-        # During the adapter call, context should be set
+    async def capture_context_stream(text, session_key):
+        # During streaming, context should be set
         captured_context["ctx"] = telegram_webhook.get_telegram_context(session_key)
         captured_context["session_key"] = session_key
-        return "response"
+        yield StreamEvent(type="done", content="response")
 
     mock_adapter = AsyncMock()
-    mock_adapter.send_message = AsyncMock(side_effect=capture_context)
+    mock_adapter.send_message_stream = MagicMock(side_effect=capture_context_stream)
     mock_adapter.config = {"persona_name": "TestBot"}
     _setup_module(mock_adapter)
 
@@ -317,13 +338,13 @@ async def test_telegram_context_set_during_send_message():
 async def test_fallback_skipped_when_tool_used():
     """_send_telegram_response should NOT be called when the tool already sent messages."""
 
-    async def fake_send(text, session_key):
+    async def fake_stream(text, session_key):
         # Simulate the tool being used during the LLM run
         telegram_webhook.mark_telegram_tool_used(session_key)
-        return "tool already sent this"
+        yield StreamEvent(type="done", content="tool already sent this")
 
     mock_adapter = AsyncMock()
-    mock_adapter.send_message = AsyncMock(side_effect=fake_send)
+    mock_adapter.send_message_stream = MagicMock(side_effect=fake_stream)
     mock_adapter.config = {"persona_name": "TestBot"}
     _setup_module(mock_adapter)
 
@@ -345,7 +366,7 @@ async def test_fallback_skipped_when_tool_used():
 async def test_fallback_sent_when_tool_not_used():
     """_send_telegram_response should be called normally when tool was not used."""
     mock_adapter = AsyncMock()
-    mock_adapter.send_message = AsyncMock(return_value="Normal response")
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_simple)
     mock_adapter.config = {"persona_name": "TestBot"}
     _setup_module(mock_adapter)
 
@@ -358,6 +379,82 @@ async def test_fallback_sent_when_tool_not_used():
                 assert resp.status == 200
 
             # Fallback SHOULD have been called since tool wasn't used
-            mock_send.assert_called_once_with("test-bot-token", 42, "Normal response")
+            mock_send.assert_called_once_with("test-bot-token", 42, "Hello from the agent!")
     finally:
         _teardown_module()
+
+
+# --- Streaming + tool collection tests ---
+
+
+@pytest.mark.asyncio
+async def test_streaming_collects_tool_calls():
+    """Streaming should collect tool_start/tool_end pairs into tool_calls list."""
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_with_tools)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    _setup_module(mock_adapter)
+
+    persist_args = {}
+
+    def capture_persist(*args, **kwargs):
+        persist_args["args"] = args
+        persist_args["kwargs"] = kwargs
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response") as mock_send, \
+                 patch.object(telegram_webhook, "_persist_telegram_messages", side_effect=capture_persist):
+                resp = await client.post("/webhooks/telegram", json=_make_update("ls"))
+                assert resp.status == 200
+
+            # Response text from the done event
+            mock_send.assert_called_once_with("test-bot-token", 42, "Here are the files.")
+
+        # Check tool_calls were passed to persist
+        assert "kwargs" in persist_args
+        tool_calls = persist_args["kwargs"].get("tool_calls", [])
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["name"] == "execute_command"
+        assert tool_calls[0]["input"] == {"command": "ls"}
+        assert tool_calls[0]["output"] == "file.txt\n"
+        assert tool_calls[0]["duration_ms"] >= 0
+
+        # Check usage was passed
+        assert persist_args["kwargs"]["tokens_in"] == 50
+        assert persist_args["kwargs"]["tokens_out"] == 20
+    finally:
+        _teardown_module()
+
+
+@pytest.mark.asyncio
+async def test_persist_includes_tool_calls_in_payload():
+    """The persist function should include tool_calls in the HTTP payload."""
+    import urllib.request
+
+    captured_payload = {}
+
+    def mock_urlopen(req, timeout=15):
+        captured_payload["data"] = json.loads(req.data)
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+        mock_resp.__enter__ = lambda s: mock_resp
+        mock_resp.__exit__ = lambda s, *a: None
+        return mock_resp
+
+    with patch.dict("os.environ", {"TERMO_API_URL": "http://api", "TERMO_TOKEN": "tok"}), \
+         patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        telegram_webhook._persist_telegram_messages(
+            "ch1", "42", "100", "testuser", "Hello", "World",
+            tool_calls=[{"name": "run", "input": {}, "output": "ok", "duration_ms": 100}],
+            tokens_in=10,
+            tokens_out=5,
+        )
+
+    assert "data" in captured_payload
+    payload = captured_payload["data"]
+    assert len(payload["tool_calls"]) == 1
+    assert payload["tool_calls"][0]["name"] == "run"
+    assert payload["tokens_in"] == 10
+    assert payload["tokens_out"] == 5
