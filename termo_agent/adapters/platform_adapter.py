@@ -926,7 +926,7 @@ def _define_tools(browser_enabled: bool = False):
             name: Service name (e.g. "web", "api", "worker"). Lowercase, no spaces.
             command: Full command to run (e.g. "npm run dev", "python app.py")
             port: Optional HTTP port the app listens on. If set, the app becomes
-                  publicly accessible at your public URL under /app/
+                  publicly accessible at your public URL.
         """
         sname = re.sub(r"[^a-z0-9_-]", "", name.lower()) or "app"
         if sname in ("agent", "pinchtab"):
@@ -949,7 +949,7 @@ def _define_tools(browser_enabled: bool = False):
             port_file = Path("/home/sprite/agent/.app_port")
             port_file.write_text(str(port))
             public_url = os.environ.get("TERMO_PUBLIC_URL", "")
-            return f"{output}\n\nApp '{sname}' running. Publicly accessible at: {public_url}/app/"
+            return f"{output}\n\nApp '{sname}' running. Publicly accessible at: {public_url}/"
 
         return output or f"[service '{sname}' created]"
 
@@ -1785,17 +1785,31 @@ class Adapter(AgentAdapter):
             ("GET", "/api/apps", self._handle_list_apps),
             ("DELETE", "/api/apps/{name}", self._handle_delete_app),
         ]
-        # App reverse proxy — all methods
-        for method in ("GET", "POST", "PUT", "DELETE", "PATCH"):
-            routes.append((method, "/app/{path:.*}", self._handle_app_proxy))
         routes.extend(telegram_webhook.get_routes())
+        # Catch-all fallback: proxy unmatched routes to the user's app.
+        # MUST be last so it doesn't shadow agent routes.
+        for method in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+            routes.append((method, "/{path:.*}", self._handle_app_proxy))
         return routes
 
     def public_route_prefixes(self) -> list[str]:
         from termo_agent import telegram_webhook
-        prefixes = ["/health", "/workspace/", "/app/", "/api/apps"]
+        prefixes = ["/health", "/workspace/", "/api/apps"]
         prefixes.extend(telegram_webhook.get_public_prefixes())
         return prefixes
+
+    # Known agent-internal path prefixes that must NOT be proxied
+    _AGENT_PREFIXES = ("/api/", "/health")
+
+    def is_public_request(self, path: str) -> bool:
+        """Allow unauthenticated access to the catch-all app proxy.
+
+        When .app_port exists and the path doesn't match a known agent route,
+        the request is destined for the user's app and should be public.
+        """
+        if any(path.startswith(p) for p in self._AGENT_PREFIXES):
+            return False
+        return Path("/home/sprite/agent/.app_port").exists()
 
     # --- Extra route handlers ---
 
@@ -1825,7 +1839,7 @@ class Adapter(AgentAdapter):
     _RESERVED_SERVICES = {"agent", "pinchtab"}
 
     async def _handle_app_proxy(self, request: web.Request) -> web.Response:
-        """Reverse proxy /app/* to localhost:{port} where port is read from .app_port."""
+        """Catch-all reverse proxy to localhost:{port} for the user's running app."""
         port_file = Path("/home/sprite/agent/.app_port")
         if not port_file.exists():
             return web.json_response({"error": "no app running"}, status=404)

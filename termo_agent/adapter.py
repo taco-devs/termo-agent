@@ -142,3 +142,12 @@ class AgentAdapter(ABC):
         Override to add more public paths (e.g. ["/health", "/workspace/"]).
         """
         return ["/health"]
+
+    def is_public_request(self, path: str) -> bool:
+        """Dynamic public-path check called by the auth middleware.
+
+        Override this for logic that can't be expressed as static prefixes
+        (e.g. catch-all app proxy that's only public when an app is running).
+        Default: returns False (defer to public_route_prefixes).
+        """
+        return False

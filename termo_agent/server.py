@@ -47,6 +47,9 @@ class AgentServer:
         for prefix in public_prefixes:
             if request.path.startswith(prefix):
                 return await handler(request)
+        # Dynamic check (e.g. app proxy when an app is running)
+        if self.adapter.is_public_request(request.path):
+            return await handler(request)
         if not self._check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
