@@ -73,8 +73,8 @@ def _get_collection():
     CHROMA_DIR.mkdir(exist_ok=True)
 
     config = _load_config()
-    api_base = config.get("api_base", "https://api.termo.ai/v1")
-    api_key = config.get("api_key", "")
+    api_base = os.environ.get("TERMO_API_BASE") or config.get("api_base", "https://api.termo.ai/v1")
+    api_key = os.environ.get("TERMO_API_KEY") or config.get("api_key", "")
 
     embed_fn = TermoEmbeddingFunction(api_base=api_base, api_key=api_key)
 
