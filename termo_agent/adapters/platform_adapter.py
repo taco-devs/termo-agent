@@ -207,10 +207,17 @@ def _extract_and_save_memories(user_message: str, assistant_response: str, sessi
             "temperature": 0.0,
         }).encode()
 
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        agent_id = os.environ.get("TERMO_AGENT_ID", "")
+        if agent_id:
+            headers["X-Agent-Id"] = agent_id
         req = urllib.request.Request(
             f"{api_base}/chat/completions",
             data=payload,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=15) as resp:

@@ -30,13 +30,20 @@ class TermoEmbeddingFunction(EmbeddingFunction):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.agent_id = os.environ.get("TERMO_AGENT_ID", "")
 
     def __call__(self, input: Documents) -> Embeddings:
         payload = json.dumps({"model": self.model, "input": input}).encode()
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.agent_id:
+            headers["X-Agent-Id"] = self.agent_id
         req = urllib.request.Request(
             f"{self.api_base}/embeddings",
             data=payload,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers=headers,
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
