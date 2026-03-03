@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import AsyncIterator
 
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
@@ -71,6 +72,11 @@ _DENY_PATTERNS = [
     # Block binding to port 8080 (reserved for agent runtime)
     r"\b8080\b.*\b(server|listen|bind|http\.server)\b",
     r"\b(server|listen|bind|http\.server)\b.*\b8080\b",
+    # Block background process patterns — agents must use run_app tool
+    r"&\s*$",       # command ending with &
+    r"\bnohup\b",   # nohup
+    r"\bsetsid\b",  # setsid
+    r"\bdisown\b",  # disown
 ]
 
 # --- Smart memory: extraction prompt ---
@@ -277,6 +283,11 @@ def _define_tools(browser_enabled: bool = False):
         """Execute a shell command on the agent's machine. Returns stdout + stderr.
         Use this to run scripts, install packages, check system info, etc.
         The working directory is /home/sprite/workspace."""
+        # Background-process patterns → suggest run_app
+        _BG_PATTERNS = [r"&\s*$", r"\bnohup\b", r"\bsetsid\b", r"\bdisown\b"]
+        for pattern in _BG_PATTERNS:
+            if re.search(pattern, command):
+                return "[blocked: use the run_app tool to start long-running processes instead of &/nohup]"
         for pattern in _DENY_PATTERNS:
             if re.search(pattern, command):
                 return "[blocked: dangerous command pattern detected]"
@@ -905,6 +916,43 @@ def _define_tools(browser_enabled: bool = False):
         except Exception as e:
             return f"[error: {e}]"
 
+    @function_tool
+    def run_app(name: str, command: str, port: int | None = None) -> str:
+        """Start a long-running app or service. Use this instead of background
+        processes (&, nohup). The app will be managed by the platform with
+        auto-restart on crash.
+
+        Args:
+            name: Service name (e.g. "web", "api", "worker"). Lowercase, no spaces.
+            command: Full command to run (e.g. "npm run dev", "python app.py")
+            port: Optional HTTP port the app listens on. If set, the app becomes
+                  publicly accessible at your public URL under /app/
+        """
+        sname = re.sub(r"[^a-z0-9_-]", "", name.lower()) or "app"
+        if sname in ("agent", "pinchtab"):
+            return f"[blocked: '{sname}' is a reserved service name]"
+
+        escaped = command.replace("'", "'\\''")
+        cmd = f"sprite-env services create {sname} --cmd bash --args '-c,{escaped}' --dir /home/sprite/workspace --no-stream"
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=30, cwd=str(WORKSPACE),
+            )
+            output = (result.stdout + result.stderr).strip()
+        except subprocess.TimeoutExpired:
+            return "[error: timed out creating service]"
+        except Exception as e:
+            return f"[error: {e}]"
+
+        if port:
+            port_file = Path("/home/sprite/agent/.app_port")
+            port_file.write_text(str(port))
+            public_url = os.environ.get("TERMO_PUBLIC_URL", "")
+            return f"{output}\n\nApp '{sname}' running. Publicly accessible at: {public_url}/app/"
+
+        return output or f"[service '{sname}' created]"
+
     # Return all tools as a dict
     tools = {
         "execute_command": execute_command,
@@ -929,6 +977,7 @@ def _define_tools(browser_enabled: bool = False):
         "uninstall_skill": uninstall_skill,
         "list_agents": list_agents,
         "call_agent": call_agent,
+        "run_app": run_app,
     }
 
     if browser_enabled:
@@ -1704,6 +1753,7 @@ class Adapter(AgentAdapter):
             {"name": "install_skill", "description": "Install a skill into long-term memory"},
             {"name": "list_agents", "description": "List other agents you can communicate with"},
             {"name": "call_agent", "description": "Send a message to another agent and get their response"},
+            {"name": "run_app", "description": "Start a long-running app or service (managed, auto-restart)"},
         ]
         if self.config.get("browser_enabled"):
             tools.extend([
@@ -1731,13 +1781,19 @@ class Adapter(AgentAdapter):
         routes = [
             ("POST", "/api/memory/search", self._handle_search_memory),
             ("GET", "/workspace/{path:.*}", self._handle_workspace_file),
+            # App management API
+            ("GET", "/api/apps", self._handle_list_apps),
+            ("DELETE", "/api/apps/{name}", self._handle_delete_app),
         ]
+        # App reverse proxy — all methods
+        for method in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+            routes.append((method, "/app/{path:.*}", self._handle_app_proxy))
         routes.extend(telegram_webhook.get_routes())
         return routes
 
     def public_route_prefixes(self) -> list[str]:
         from termo_agent import telegram_webhook
-        prefixes = ["/health", "/workspace/"]
+        prefixes = ["/health", "/workspace/", "/app/", "/api/apps"]
         prefixes.extend(telegram_webhook.get_public_prefixes())
         return prefixes
 
@@ -1763,3 +1819,70 @@ class Adapter(AgentAdapter):
             raise web.HTTPNotFound(text="file not found")
         content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         return web.FileResponse(file_path, headers={"Content-Type": content_type})
+
+    # --- App proxy + management handlers ---
+
+    _RESERVED_SERVICES = {"agent", "pinchtab"}
+
+    async def _handle_app_proxy(self, request: web.Request) -> web.Response:
+        """Reverse proxy /app/* to localhost:{port} where port is read from .app_port."""
+        port_file = Path("/home/sprite/agent/.app_port")
+        if not port_file.exists():
+            return web.json_response({"error": "no app running"}, status=404)
+        try:
+            port = int(port_file.read_text().strip())
+        except (ValueError, OSError):
+            return web.json_response({"error": "invalid app port"}, status=500)
+        path = request.match_info.get("path", "")
+        qs = request.query_string
+        target = f"http://localhost:{port}/{path}"
+        if qs:
+            target += f"?{qs}"
+        try:
+            body = await request.read()
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    request.method, target,
+                    headers={k: v for k, v in request.headers.items() if k.lower() != "host"},
+                    data=body if body else None,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    resp_body = await resp.read()
+                    headers = {k: v for k, v in resp.headers.items()
+                               if k.lower() not in ("transfer-encoding", "content-encoding")}
+                    return web.Response(body=resp_body, status=resp.status, headers=headers)
+        except aiohttp.ClientError as e:
+            return web.json_response({"error": f"proxy error: {e}"}, status=502)
+
+    async def _handle_list_apps(self, request: web.Request) -> web.Response:
+        """GET /api/apps — list running user apps (excludes reserved services)."""
+        try:
+            result = subprocess.run(
+                "sprite-env services list --json",
+                shell=True, capture_output=True, text=True, timeout=10,
+            )
+            services = json.loads(result.stdout) if result.stdout.strip() else []
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+            services = []
+        apps = [
+            {"name": s.get("name"), "status": s.get("status"), "command": s.get("command", "")}
+            for s in services
+            if s.get("name") not in self._RESERVED_SERVICES
+        ]
+        return web.json_response(apps)
+
+    async def _handle_delete_app(self, request: web.Request) -> web.Response:
+        """DELETE /api/apps/{name} — stop + delete a user app."""
+        name = request.match_info["name"]
+        if name in self._RESERVED_SERVICES:
+            return web.json_response({"error": f"cannot delete reserved service '{name}'"}, status=403)
+        subprocess.run(f"sprite-env services stop {name}", shell=True, capture_output=True, timeout=10)
+        subprocess.run(f"sprite-env services delete {name}", shell=True, capture_output=True, timeout=10)
+        # Clean up .app_port if it belonged to this service
+        port_file = Path("/home/sprite/agent/.app_port")
+        if port_file.exists():
+            try:
+                port_file.unlink()
+            except OSError:
+                pass
+        return web.json_response({"status": "deleted"})

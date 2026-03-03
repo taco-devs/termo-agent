@@ -71,6 +71,25 @@ class TestDenyPatterns:
     def test_port_8080_blocked(self, cmd):
         assert any(re.search(p, cmd) for p in _DENY_PATTERNS), f"Should block port 8080: {cmd}"
 
+    @pytest.mark.parametrize("cmd", [
+        "npm run dev &",
+        "python app.py &",
+        "nohup node server.js",
+        "setsid python worker.py",
+        "python app.py & disown",
+    ])
+    def test_background_process_patterns_blocked(self, cmd):
+        """Background process patterns (&, nohup, setsid, disown) should be blocked."""
+        assert any(re.search(p, cmd) for p in _DENY_PATTERNS), f"Should block: {cmd}"
+
+    @pytest.mark.parametrize("cmd", [
+        "echo 'foo & bar'",       # & inside quotes (not at end)
+        "ls -la && echo done",    # && is not &\s*$
+    ])
+    def test_safe_ampersand_not_blocked(self, cmd):
+        """Commands with & in the middle (&&) or non-trailing should be safe."""
+        assert not any(re.search(p, cmd) for p in _DENY_PATTERNS), f"Should allow: {cmd}"
+
 
 # ---------------------------------------------------------------------------
 # Vague message detection
