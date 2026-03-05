@@ -26,6 +26,12 @@ _telegram_contexts: dict[str, dict] = {}   # session_key → {bot_token, chat_id
 _telegram_tool_used: dict[str, bool] = {}  # session_key → True if tool was called
 _telegram_sent_messages: dict[str, list[str]] = {}  # session_key → [text1, text2, ...]
 
+# Per-chat locks to serialize message processing (prevents race conditions on context dicts)
+_chat_locks: dict[int, asyncio.Lock] = {}
+
+# prevent GC from collecting fire-and-forget tasks (Python asyncio requirement)
+_background_tasks: set = set()
+
 TELEGRAM_API = "https://api.telegram.org"
 MAX_TELEGRAM_MESSAGE = 4096
 
@@ -54,14 +60,6 @@ def get_public_prefixes() -> list[str]:
     if not _channels:
         return []
     return ["/webhooks/"]
-
-
-def _get_channel_for_token(bot_token: str) -> dict | None:
-    """Find the channel config matching a bot token."""
-    for ch in _channels:
-        if ch.get("config", {}).get("bot_token") == bot_token:
-            return ch
-    return None
 
 
 def _get_default_channel() -> dict | None:
@@ -261,6 +259,14 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     if not bot_token:
         return web.json_response({"ok": True})
 
+    # Verify webhook secret if configured (prevents spoofed updates)
+    webhook_secret = channel.get("config", {}).get("webhook_secret", "")
+    if webhook_secret:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_secret != webhook_secret:
+            log.warning("Telegram webhook secret mismatch from %s", request.remote)
+            return web.json_response({"ok": True})
+
     # Handle /start command
     if text.strip() == "/start":
         persona_name = "Assistant"
@@ -270,86 +276,98 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
         await asyncio.to_thread(_send_telegram_message, bot_token, chat_id, welcome)
         return web.json_response({"ok": True})
 
-    # Send typing indicator
-    asyncio.create_task(asyncio.to_thread(_send_typing, bot_token, chat_id))
+    # Serialize per chat — prevents race conditions on context dicts when
+    # the same user sends multiple messages before the first finishes.
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
 
-    # Process message through adapter's LLM pipeline (streaming to capture tool calls)
-    session_key = f"telegram:{chat_id}"
+    async with _chat_locks[chat_id]:
+        # Send typing indicator
+        _t = asyncio.create_task(asyncio.to_thread(_send_typing, bot_token, chat_id))
+        _background_tasks.add(_t)
+        _t.add_done_callback(_background_tasks.discard)
 
-    # Store context so the telegram tool can send messages during the LLM run
-    _telegram_contexts[session_key] = {"bot_token": bot_token, "chat_id": chat_id}
-    _telegram_tool_used[session_key] = False
+        # Process message through adapter's LLM pipeline (streaming to capture tool calls)
+        session_key = f"telegram:{chat_id}"
 
-    response = ""
-    tool_calls = []
-    tokens_in = 0
-    tokens_out = 0
-    _active_tools: dict[str, dict] = {}  # call_id → {name, input, start_time}
-    _last_typing = time.monotonic()
+        # Store context so the telegram tool can send messages during the LLM run
+        _telegram_contexts[session_key] = {"bot_token": bot_token, "chat_id": chat_id}
+        _telegram_tool_used[session_key] = False
 
-    try:
-        async for event in _adapter.send_message_stream(text, session_key):
-            # Re-send typing every 4 seconds during long tool runs
-            now_mono = time.monotonic()
-            if now_mono - _last_typing > 4:
-                asyncio.create_task(asyncio.to_thread(_send_typing, bot_token, chat_id))
-                _last_typing = now_mono
+        response = ""
+        tool_calls = []
+        tokens_in = 0
+        tokens_out = 0
+        _active_tools: dict[str, dict] = {}  # call_id → {name, input, start_time}
+        _last_typing = time.monotonic()
 
-            if event.type == "tool_start":
-                call_id = event.metadata.get("call_id", "")
-                _active_tools[call_id] = {
-                    "name": event.name,
-                    "input": event.metadata.get("input", {}),
-                    "start_time": time.time(),
-                }
+        try:
+            async for event in _adapter.send_message_stream(text, session_key):
+                # Re-send typing every 4 seconds during long tool runs
+                now_mono = time.monotonic()
+                if now_mono - _last_typing > 4:
+                    _t2 = asyncio.create_task(asyncio.to_thread(_send_typing, bot_token, chat_id))
+                    _background_tasks.add(_t2)
+                    _t2.add_done_callback(_background_tasks.discard)
+                    _last_typing = now_mono
 
-            elif event.type == "tool_end":
-                call_id = event.metadata.get("call_id", "")
-                started = _active_tools.pop(call_id, None)
-                if started:
-                    duration_ms = int((time.time() - started["start_time"]) * 1000)
-                    tool_calls.append({
-                        "name": started["name"],
-                        "input": started["input"],
-                        "output": event.metadata.get("output", ""),
-                        "duration_ms": duration_ms,
-                    })
+                if event.type == "tool_start":
+                    call_id = event.metadata.get("call_id", "")
+                    _active_tools[call_id] = {
+                        "name": event.name,
+                        "input": event.metadata.get("input", {}),
+                        "start_time": time.time(),
+                    }
 
-            elif event.type == "done":
-                response = event.content or ""
-                usage = event.usage or {}
-                tokens_in = usage.get("prompt_tokens", 0)
-                tokens_out = usage.get("completion_tokens", 0)
+                elif event.type == "tool_end":
+                    call_id = event.metadata.get("call_id", "")
+                    started = _active_tools.pop(call_id, None)
+                    if started:
+                        duration_ms = int((time.time() - started["start_time"]) * 1000)
+                        tool_calls.append({
+                            "name": started["name"],
+                            "input": started["input"],
+                            "output": event.metadata.get("output", ""),
+                            "duration_ms": duration_ms,
+                        })
 
-    except Exception as e:
-        log.error("Adapter streaming error for telegram:%s: %s", chat_id, e)
-        response = "Sorry, I encountered an error processing your message."
+                elif event.type == "done":
+                    response = event.content or ""
+                    usage = event.usage or {}
+                    tokens_in = usage.get("prompt_tokens", 0)
+                    tokens_out = usage.get("completion_tokens", 0)
 
-    # Only send the fallback text response if the tool didn't already send messages
-    if not was_telegram_tool_used(session_key):
-        await asyncio.to_thread(_send_telegram_response, bot_token, chat_id, response)
+        except Exception as e:
+            log.error("Adapter streaming error for telegram:%s: %s", chat_id, e)
+            response = "Sorry, I encountered an error processing your message."
 
-    # Use tool-sent messages for persistence if available, otherwise fall back to done content
-    sent = get_sent_messages(session_key)
-    persist_content = "\n\n".join(sent) if sent else response
+        # Only send the fallback text response if the tool didn't already send messages
+        if not was_telegram_tool_used(session_key):
+            await asyncio.to_thread(_send_telegram_response, bot_token, chat_id, response)
 
-    # Fire-and-forget persistence
-    asyncio.create_task(asyncio.to_thread(
-        _persist_telegram_messages,
-        channel_id,
-        str(chat_id),
-        user_id,
-        user_name,
-        text,
-        persist_content,
-        tool_calls=tool_calls,
-        tokens_in=tokens_in,
-        tokens_out=tokens_out,
-    ))
+        # Use tool-sent messages for persistence if available, otherwise fall back to done content
+        sent = get_sent_messages(session_key)
+        persist_content = "\n\n".join(sent) if sent else response
 
-    # Clean up context
-    _telegram_contexts.pop(session_key, None)
-    _telegram_tool_used.pop(session_key, None)
-    _telegram_sent_messages.pop(session_key, None)
+        # Fire-and-forget persistence (must save task ref to prevent GC collection)
+        task = asyncio.create_task(asyncio.to_thread(
+            _persist_telegram_messages,
+            channel_id,
+            str(chat_id),
+            user_id,
+            user_name,
+            text,
+            persist_content,
+            tool_calls=tool_calls,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        ))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+        # Clean up context
+        _telegram_contexts.pop(session_key, None)
+        _telegram_tool_used.pop(session_key, None)
+        _telegram_sent_messages.pop(session_key, None)
 
     return web.json_response({"ok": True})

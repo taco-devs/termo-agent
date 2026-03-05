@@ -1,5 +1,6 @@
 """Tests for the Telegram webhook handler module."""
 
+import asyncio
 import json
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -458,3 +459,139 @@ async def test_persist_includes_tool_calls_in_payload():
     assert payload["tool_calls"][0]["name"] == "run"
     assert payload["tokens_in"] == 10
     assert payload["tokens_out"] == 5
+
+
+# --- Webhook secret verification tests ---
+
+
+@pytest.mark.asyncio
+async def test_webhook_secret_rejects_bad_token():
+    """Requests with wrong secret should be silently rejected."""
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_simple)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    telegram_webhook._adapter = mock_adapter
+    telegram_webhook._channels = [
+        {
+            "id": "channel-123",
+            "type": "telegram",
+            "enabled": True,
+            "config": {"bot_token": "test-bot-token", "webhook_secret": "my-secret-123"},
+        }
+    ]
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            # Wrong secret
+            resp = await client.post(
+                "/webhooks/telegram",
+                json=_make_update("Hello"),
+                headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
+            )
+            assert resp.status == 200
+            # Adapter should NOT have been called
+            mock_adapter.send_message_stream.assert_not_called()
+
+            # Missing secret header
+            resp = await client.post("/webhooks/telegram", json=_make_update("Hello"))
+            assert resp.status == 200
+            mock_adapter.send_message_stream.assert_not_called()
+    finally:
+        _teardown_module()
+
+
+@pytest.mark.asyncio
+async def test_webhook_secret_accepts_correct_token():
+    """Requests with correct secret should be processed."""
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_simple)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    telegram_webhook._adapter = mock_adapter
+    telegram_webhook._channels = [
+        {
+            "id": "channel-123",
+            "type": "telegram",
+            "enabled": True,
+            "config": {"bot_token": "test-bot-token", "webhook_secret": "my-secret-123"},
+        }
+    ]
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response"), \
+                 patch.object(telegram_webhook, "_persist_telegram_messages"):
+                resp = await client.post(
+                    "/webhooks/telegram",
+                    json=_make_update("Hello"),
+                    headers={"X-Telegram-Bot-Api-Secret-Token": "my-secret-123"},
+                )
+                assert resp.status == 200
+            mock_adapter.send_message_stream.assert_called_once()
+    finally:
+        _teardown_module()
+
+
+@pytest.mark.asyncio
+async def test_no_webhook_secret_allows_all():
+    """When no secret is configured, all requests should be processed."""
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message_stream = MagicMock(side_effect=_stream_simple)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    _setup_module(mock_adapter)  # default config has no webhook_secret
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response"), \
+                 patch.object(telegram_webhook, "_persist_telegram_messages"):
+                resp = await client.post("/webhooks/telegram", json=_make_update("Hello"))
+                assert resp.status == 200
+            mock_adapter.send_message_stream.assert_called_once()
+    finally:
+        _teardown_module()
+
+
+# --- Concurrent message serialization tests ---
+
+
+@pytest.mark.asyncio
+async def test_concurrent_messages_serialized():
+    """Two messages from the same chat should be processed sequentially, not interleaved."""
+    order = []
+
+    async def slow_stream(text, session_key):
+        order.append(f"start:{text}")
+        await asyncio.sleep(0.05)
+        order.append(f"end:{text}")
+        yield StreamEvent(type="done", content=f"reply to {text}")
+
+    mock_adapter = AsyncMock()
+    mock_adapter.send_message_stream = MagicMock(side_effect=slow_stream)
+    mock_adapter.config = {"persona_name": "TestBot"}
+    _setup_module(mock_adapter)
+
+    try:
+        async with TestClient(TestServer(_make_app())) as client:
+            with patch.object(telegram_webhook, "_send_typing"), \
+                 patch.object(telegram_webhook, "_send_telegram_response"), \
+                 patch.object(telegram_webhook, "_persist_telegram_messages"):
+                # Send two messages concurrently from the same chat_id
+                t1 = asyncio.create_task(
+                    client.post("/webhooks/telegram", json=_make_update("msg1", chat_id=42))
+                )
+                t2 = asyncio.create_task(
+                    client.post("/webhooks/telegram", json=_make_update("msg2", chat_id=42))
+                )
+                r1, r2 = await asyncio.gather(t1, t2)
+                assert r1.status == 200
+                assert r2.status == 200
+
+        # With the lock, processing should be serial: start1, end1, start2, end2
+        # (not interleaved like start1, start2, end1, end2)
+        assert order[0].startswith("start:")
+        assert order[1].startswith("end:")
+        assert order[1].endswith(order[0].split(":")[1])  # same message
+    finally:
+        _teardown_module()
+        telegram_webhook._chat_locks.clear()
