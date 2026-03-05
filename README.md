@@ -5,7 +5,7 @@
 <h1 align="center">termo-agent</h1>
 
 <p align="center">
-  <strong>Open-source serverless runtime for AI agents.</strong><br/>
+  <strong>Serverless AI agent runtime for Firecracker VMs.</strong><br/>
   Bring any framework. Get a production server. Deploy anywhere.
 </p>
 
@@ -29,17 +29,36 @@
 
 ## What is termo-agent?
 
-**termo-agent** is the open-source runtime that powers [Termo](https://termo.ai) — the platform where AI agents get their own machine. It turns any Python agent framework into a production-ready HTTP server with:
+**termo-agent** is an open-source serverless runtime that gives every AI agent its own isolated machine. Built for [Firecracker microVMs](https://firecracker-microvm.github.io/), it turns any Python agent framework into a production HTTP server with auto-sleep/wake lifecycle, persistent state, and a full tool ecosystem.
 
-- **SSE Streaming** &mdash; Real-time token streaming out of the box
-- **Session Management** &mdash; Persistent conversations with automatic history
-- **Auth Middleware** &mdash; Bearer token authentication with configurable public paths
-- **Adapter Pattern** &mdash; Plug in OpenAI Agents SDK, LangChain, CrewAI, or your own framework
-- **Memory** &mdash; Built-in memory endpoints for semantic long-term storage
-- **Heartbeat** &mdash; Periodic autonomous tasks that run on a schedule
-- **Browser Tools** &mdash; Optional Chrome + PinchTab integration for navigating JS-heavy sites
-- **Extra Routes** &mdash; Adapters can declare custom HTTP endpoints
-- **Zero Config Deploy** &mdash; One command to install, one command to run
+It powers [Termo](https://termo.ai), where agents run on persistent VMs with shell access, filesystems, and long-term memory.
+
+### Why Firecracker?
+
+Containers share a kernel. Firecracker VMs don't. Each agent gets hardware-level isolation in a VM that boots in ~125ms and consumes <5MB of memory overhead. This means:
+
+- **Agents can safely run shell commands, install packages, and modify files** — they can't escape their VM
+- **Auto-sleep / auto-wake** — VMs suspend to disk when idle and resume on HTTP request (~500ms)
+- **Persistent state** — filesystem, memory, and sessions survive sleep cycles
+- **No cold start tax** — warm VMs resume instantly, cold VMs boot in under a second
+
+### Features
+
+- **SSE Streaming** — Real-time token streaming out of the box
+- **Session Management** — Persistent conversations with automatic history
+- **Auth Middleware** — Bearer token authentication with configurable public paths
+- **Adapter Pattern** — Plug in OpenAI Agents SDK, Claude SDK, LangChain, CrewAI, or your own framework
+- **Semantic Memory** — ChromaDB-backed long-term memory with embedding search
+- **Skills Marketplace** — Agents can discover, install, and load skills at runtime
+- **Agent-to-Agent Calls** — Agents can discover siblings and delegate tasks to each other
+- **Subtasks** — Parallel background task execution with parent-child message threading
+- **Schedule Management** — Agents can create, list, and delete their own cron jobs
+- **Proactive Messaging** — Agents can push messages to conversations without being prompted
+- **Heartbeat** — Periodic autonomous tasks that run on a schedule
+- **Telegram Integration** — Webhook handler with per-chat serialization and secret verification
+- **Browser Tools** — Optional Chrome + PinchTab integration for navigating JS-heavy sites
+- **Extra Routes** — Adapters can declare custom HTTP endpoints
+- **Zero Config Deploy** — One command to install, one command to run
 
 ## Quick Start
 
@@ -48,6 +67,9 @@ pip install termo-agent
 
 # With OpenAI Agents SDK support:
 pip install 'termo-agent[openai]'
+
+# With Claude SDK support:
+pip install 'termo-agent[anthropic]'
 ```
 
 ```bash
@@ -63,9 +85,24 @@ termo-agent --adapter openai_agents --token my-secret-token
 
 Your agent is now live at `http://localhost:8080` with a full REST API.
 
+The CLI automatically loads `.env` from the working directory, so you can set `TERMO_TOKEN`, `TERMO_API_URL`, and other config there.
+
+## Deploy to a Firecracker VM
+
+termo-agent runs on any platform that supports Firecracker microVMs:
+
+| Platform | How |
+|----------|-----|
+| [**Termo**](https://app.termo.ai) | Managed — create an agent and it's live in seconds |
+| [**Sprites.dev**](https://sprites.dev) | `sprite create my-agent` then install and register as a service |
+| [**Fly.io**](https://fly.io) | `fly launch` with a Dockerfile that runs `termo-agent` |
+| **Self-hosted** | Any Firecracker/Cloud Hypervisor host — run `termo-agent` as a systemd service |
+
+The runtime is designed for the serverless lifecycle: it loads state from disk on wake, serves requests, and cleanly persists state on shutdown.
+
 ## Writing an Adapter
 
-Implement `AgentAdapter` to connect any agent framework to the termo-agent runtime:
+Implement `AgentAdapter` to connect any agent framework to the runtime. Only 5 methods are required — everything else has sensible defaults:
 
 ```python
 from termo_agent import AgentAdapter, StreamEvent
@@ -94,7 +131,30 @@ class Adapter(AgentAdapter):
         ...
 ```
 
-### Advanced: Custom Routes & Public Paths
+### Optional hooks
+
+| Method | Purpose |
+|--------|---------|
+| `get_config()` / `update_config()` | Runtime config read/write |
+| `get_memory()` / `update_memory()` | Long-term memory read/write |
+| `get_heartbeat()` / `update_heartbeat()` | Heartbeat config |
+| `list_tools()` | Expose available tools |
+| `list_sessions()` | List all sessions |
+| `extra_routes()` | Register custom HTTP endpoints |
+| `public_route_prefixes()` | Paths that skip auth |
+| `is_public_request(path)` | Dynamic auth bypass logic |
+| `health()` | Custom health check data |
+| `restart()` | Custom restart logic |
+
+### Built-in Adapters
+
+| Adapter | Framework | Install |
+|---------|-----------|---------|
+| `platform_adapter` | OpenAI Agents SDK + LiteLLM, full tool suite, semantic memory, skills | `pip install 'termo-agent[openai]'` |
+| `openai_agents` | Lightweight OpenAI Agents SDK wrapper | `pip install 'termo-agent[openai]'` |
+| `claude_agents` | Claude SDK with hook system | `pip install 'termo-agent[anthropic]'` |
+
+### Custom Routes & Public Paths
 
 Adapters can declare additional HTTP endpoints and configure which paths skip authentication:
 
@@ -110,7 +170,78 @@ class Adapter(AgentAdapter):
     def public_route_prefixes(self):
         """Paths that don't require auth."""
         return ["/health", "/api/webhook"]
+
+    def is_public_request(self, path):
+        """Dynamic check for paths that can't be expressed as prefixes."""
+        return path.startswith("/app/") and self.app_is_running
 ```
+
+## Platform Adapter Tools
+
+The `platform_adapter` ships with a full tool suite that turns an agent into an autonomous system:
+
+### Core Tools
+
+| Tool | Description |
+|------|-------------|
+| `execute_command(command)` | Run shell commands in the VM |
+| `read_file(path)` / `write_file(path, content)` / `edit_file(...)` | Filesystem operations |
+| `list_files(path)` | Directory listing |
+| `web_search(query)` | Search the web via Exa |
+| `web_fetch(url)` | Fetch and extract content from a URL |
+
+### Memory
+
+| Tool | Description |
+|------|-------------|
+| `remember(content, category)` | Store a memory with semantic embedding (ChromaDB + BGE-M3) |
+| `recall(query, limit)` | Semantic search across stored memories |
+
+Categories: `identity`, `preference`, `fact`, `project`, `user_profile`
+
+### Skills Marketplace
+
+| Tool | Description |
+|------|-------------|
+| `search_skills(query)` | Search the skill marketplace |
+| `install_skill(slug)` | Install a skill |
+| `load_skill(slug)` | Load skill instructions into context |
+| `uninstall_skill(slug)` | Remove an installed skill |
+
+### Agent Collaboration
+
+| Tool | Description |
+|------|-------------|
+| `list_agents()` | Discover sibling agents owned by the same user |
+| `call_agent(agent_slug, message)` | Send a message to another agent and get the response |
+| `launch_task(title, instructions)` | Spawn a parallel subtask (parent-child message threading) |
+
+### Scheduling & Proactive Messaging
+
+| Tool | Description |
+|------|-------------|
+| `create_schedule(cron, prompt, name)` | Create a cron job that triggers the agent |
+| `list_schedules()` | List active scheduled tasks |
+| `delete_schedule(schedule_id)` | Remove a scheduled task |
+| `send_message_to_conversation(conversation_id, message)` | Push a message to a conversation without being prompted |
+
+### Browser (optional)
+
+Enabled with `browser_enabled: true` in config. Powered by [PinchTab](https://pinchtab.com):
+
+| Tool | Description |
+|------|-------------|
+| `browse(url)` | Navigate to a URL and return page text (~800 tokens). Supports JS-rendered content. |
+| `browse_observe()` | Get interactive elements on the current page with stable refs (e0, e1...). |
+| `browse_act(ref, action, value)` | Click, type, fill, press, or scroll on an element by ref. |
+
+### Telegram (optional)
+
+Enabled by adding a `telegram` channel to config. Powered by per-chat locking and webhook secret verification:
+
+| Tool | Description |
+|------|-------------|
+| `send_telegram_message(type, text, ...)` | Send text, photos, documents, stickers, or locations to the user's Telegram chat |
 
 ## REST API
 
@@ -124,9 +255,11 @@ Every termo-agent server exposes the same API:
 | `GET` | `/api/sessions` | List all sessions |
 | `GET` | `/api/config` | Get agent config |
 | `PATCH` | `/api/config` | Update config at runtime |
+| `POST` | `/api/update` | Hot-reload config from platform |
 | `GET` | `/api/tools` | List available tools |
 | `GET` | `/api/memory` | Get agent memory |
 | `PATCH` | `/api/memory` | Update memory |
+| `POST` | `/api/memory/search` | Semantic memory search |
 | `GET` | `/api/heartbeat` | Get heartbeat config |
 | `PATCH` | `/api/heartbeat` | Update heartbeat |
 | `POST` | `/api/restart` | Restart the agent |
@@ -151,43 +284,31 @@ data: {"type": "done", "content": "Hello there! Here's what I found...", "usage"
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                 termo-agent                  │
-│                                             │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │   Auth   │→ │  Server  │→ │ Adapter  │  │
-│  │Middleware │  │ (aiohttp)│  │(your code)│  │
-│  └──────────┘  └──────────┘  └──────────┘  │
-│        ↓             ↓             ↓        │
-│   Bearer Token   REST API    Any Framework  │
-│   Public Paths   SSE Stream  OpenAI / LC /  │
-│                  Sessions    Custom / etc.   │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│              Firecracker microVM                      │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐    │
+│  │               termo-agent                     │    │
+│  │                                              │    │
+│  │  ┌────────┐  ┌────────┐  ┌──────────────┐   │    │
+│  │  │  Auth  │→ │ Server │→ │   Adapter    │   │    │
+│  │  │ Guard  │  │(aiohttp)│  │ (your code)  │   │    │
+│  │  └────────┘  └────────┘  └──────────────┘   │    │
+│  │      ↓           ↓              ↓            │    │
+│  │  Bearer Token  REST API   Any Framework      │    │
+│  │  Public Paths  SSE Stream OpenAI/Claude/LG   │    │
+│  │  Webhooks      Sessions   Custom adapters    │    │
+│  └──────────────────────────────────────────────┘    │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────┐     │
+│  │ Sessions │  │ ChromaDB │  │   Filesystem   │     │
+│  │  (disk)  │  │ (memory) │  │  (persistent)  │     │
+│  └──────────┘  └──────────┘  └────────────────┘     │
+└──────────────────────────────────────────────────────┘
+         ↑ HTTP (auto-wakes VM)
+         │
+    Users / APIs / Telegram / Cron
 ```
-
-## Browser Tools
-
-Agents with `browser_enabled: true` in their config get access to three tools powered by [PinchTab](https://pinchtab.com):
-
-| Tool | Description |
-|------|-------------|
-| `browse(url)` | Navigate to a URL and return page text (~800 tokens). Supports JS-rendered content. |
-| `browse_observe()` | Get interactive elements on the current page with stable refs (e0, e1...). |
-| `browse_act(ref, action, value)` | Click, type, fill, press, or scroll on an element by ref. |
-
-Browser tools are conditionally loaded — agents without `browser_enabled` pay zero extra tokens.
-
-## Deploy to Termo
-
-The fastest way to deploy an AI agent with its own machine, filesystem, and tools:
-
-```bash
-# Sign up at https://app.termo.ai and create an agent.
-# Your agent gets its own VM with shell access, persistent storage,
-# web search, semantic memory, and a heartbeat — all managed for you.
-```
-
-**[Get started at termo.ai &rarr;](https://app.termo.ai)**
 
 ## Contributing
 
