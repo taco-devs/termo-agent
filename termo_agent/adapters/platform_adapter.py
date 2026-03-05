@@ -569,14 +569,25 @@ def _define_tools(browser_enabled: bool = False):
 
     @function_tool
     def create_schedule(schedule: str, prompt: str, name: str = "") -> str:
-        """Create a recurring scheduled task. Each time the schedule fires, the
-        agent will be prompted with the given instruction and will generate a fresh response.
-        IMPORTANT: 'prompt' must be the user's original request or instruction — NOT
-        your own generated content. For example if the user says "send me a joke every
-        hour", the prompt should be "Tell me an original joke" (the instruction), not
-        the joke itself.
+        """Create or update a recurring scheduled task for this conversation.
+        Only ONE schedule is allowed per conversation — calling this again replaces
+        the existing schedule (no duplicates).
+
+        RULES:
+        - 'prompt' must be the user's original request/instruction — NOT your own
+          generated content. E.g. if the user says "send me a joke every hour",
+          prompt = "Tell me an original joke", not the joke itself.
+        - The prompt must NEVER instruct the agent to create, modify, or delete
+          schedules. Scheduled prompts are for content tasks only (reminders,
+          reports, check-ins). Including schedule-management instructions causes
+          infinite cron creation loops.
+        - If the user needs multiple reminders at different times, combine them
+          into a SINGLE schedule at the most frequent interval and handle the
+          logic in the prompt. Do NOT call create_schedule multiple times.
+        - Call list_schedules first to check for existing schedules before creating.
+
         schedule: cron expression (e.g. "0 9 * * *" for daily at 9am, "*/30 * * * *" for every 30 min)
-        prompt: the instruction/request that will be sent to the agent on each trigger (must be short and actionable)
+        prompt: the instruction/request sent to the agent on each trigger (short and actionable, NO schedule-management instructions)
         name: optional short label for the schedule"""
         api_url = os.environ.get("TERMO_API_URL", "")
         agent_id = os.environ.get("TERMO_AGENT_ID", "")
@@ -1286,7 +1297,8 @@ class Adapter(AgentAdapter):
             tokens_out = 0
 
             try:
-                result = Runner.run_streamed(sub_agent, input=instructions, max_turns=25)
+                _max_turns = int(os.environ.get("MAX_TURNS", "25"))
+                result = Runner.run_streamed(sub_agent, input=instructions, max_turns=_max_turns)
 
                 async for event in result.stream_events():
                     event_type = getattr(event, "type", "")
@@ -1346,7 +1358,7 @@ class Adapter(AgentAdapter):
             except Exception as e:
                 from agents.exceptions import MaxTurnsExceeded
                 if isinstance(e, MaxTurnsExceeded):
-                    final_output = "[subtask reached processing limit (25 steps). Partial results above may still be useful.]"
+                    final_output = f"[subtask reached processing limit ({_max_turns} steps). Partial results above may still be useful.]"
                 else:
                     final_output = f"[subtask error: {e}]"
 
@@ -1517,13 +1529,14 @@ class Adapter(AgentAdapter):
 
         trimmed = _trim_messages(messages)
         try:
-            result = await Runner.run(agent, input=trimmed, max_turns=25)
+            _max_turns = int(os.environ.get("MAX_TURNS", "25"))
+            result = await Runner.run(agent, input=trimmed, max_turns=_max_turns)
             assistant_content = str(result.final_output) if result.final_output else ""
         except MaxTurnsExceeded:
             _current_session_key = None
             # Summarize what was accomplished before hitting the limit
             assistant_content = (
-                "*I reached my processing limit for this turn (25 steps). "
+                f"*I reached my processing limit for this turn ({_max_turns} steps). "
                 "The work I did above has been saved. "
                 "Send me a follow-up message and I'll continue where I left off.*"
             )
@@ -1559,7 +1572,8 @@ class Adapter(AgentAdapter):
         streamed_content = ""
 
         try:
-            result = Runner.run_streamed(agent, input=trimmed, max_turns=25)
+            _max_turns = int(os.environ.get("MAX_TURNS", "25"))
+            result = Runner.run_streamed(agent, input=trimmed, max_turns=_max_turns)
 
             tokens_in = 0
             tokens_out = 0
@@ -1657,7 +1671,7 @@ class Adapter(AgentAdapter):
             if isinstance(e, MaxTurnsExceeded):
                 # Agent did real work but ran out of turns — treat as a soft completion
                 summary = (
-                    "*I reached my processing limit for this turn (25 steps). "
+                    f"*I reached my processing limit for this turn ({_max_turns} steps). "
                     "The work I did above has been saved. "
                     "Send me a follow-up message and I'll continue where I left off.*"
                 )
