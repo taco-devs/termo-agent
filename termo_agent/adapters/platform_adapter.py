@@ -1127,6 +1127,60 @@ def _get_telegram_tool():
 
 
 # ---------------------------------------------------------------------------
+# Telegram channel setup tool (injected only when bot token detected in message)
+# ---------------------------------------------------------------------------
+
+_setup_telegram_tool_instance = None
+
+# Regex: Telegram bot tokens are {8-10 digits}:{35 alphanumeric/dash/underscore chars}
+_TELEGRAM_TOKEN_RE = re.compile(r'\b(\d{8,10}:[A-Za-z0-9_-]{35})\b')
+
+
+def _get_setup_telegram_tool():
+    """Return the cached setup_telegram_channel function_tool instance."""
+    global _setup_telegram_tool_instance
+    if _setup_telegram_tool_instance is not None:
+        return _setup_telegram_tool_instance
+
+    from agents import function_tool
+
+    @function_tool
+    def setup_telegram_channel(bot_token: str) -> str:
+        """Connect a Telegram bot to this agent. The bot will receive messages and
+        reply through the agent's LLM pipeline. The user should have created the
+        bot with @BotFather on Telegram first.
+
+        bot_token: The Telegram bot token (format: 123456789:ABCdef...)
+        """
+        api_url = os.environ.get("TERMO_API_URL", "")
+        token = os.environ.get("TERMO_TOKEN", "")
+        if not api_url or not token:
+            return "[error: TERMO_API_URL or TERMO_TOKEN not configured]"
+
+        result = _api_call(
+            f"{api_url}/agents/channels/setup",
+            {"token": token, "type": "telegram", "bot_token": bot_token},
+            timeout=30,
+        )
+
+        if result.get("error"):
+            return f"[error: {result['error']}]"
+
+        status = result.get("status", "")
+        bot_username = result.get("bot_username", "")
+
+        if status == "already_connected":
+            return f"Telegram bot @{bot_username} is already connected to this agent."
+        elif status == "connected":
+            return f"Successfully connected Telegram bot @{bot_username}. The bot is now live — users can message it and the agent will respond."
+        else:
+            return f"Channel setup returned: {result}"
+
+    _setup_telegram_tool_instance = setup_telegram_channel
+    return _setup_telegram_tool_instance
+
+
+# ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
@@ -1491,6 +1545,15 @@ class Adapter(AgentAdapter):
         tools = self._tool_list[:]
         if is_telegram:
             tools.append(_get_telegram_tool())
+
+        # Detect Telegram bot token in message → inject setup tool (no permanent bloat)
+        if message and _TELEGRAM_TOKEN_RE.search(message):
+            tools.append(_get_setup_telegram_tool())
+            instructions += (
+                "\n\nThe user's message contains a Telegram bot token. "
+                "Use the `setup_telegram_channel` tool to connect it. "
+                "Extract the token from their message (format: digits:alphanumeric)."
+            )
 
         from agents import ModelSettings
         from openai.types.shared import Reasoning
